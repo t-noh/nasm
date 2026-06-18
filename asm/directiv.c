@@ -10,6 +10,7 @@
 #include "nctype.h"
 
 #include "nasm.h"
+#include "asm/lfi.h"
 #include "nasmlib.h"
 #include "ilog2.h"
 #include "error.h"
@@ -328,6 +329,9 @@ bool process_directives(char *directive)
         } else {
             globl.bits = sb;
             switch_segment(seg);
+            if (lfi_mode) {
+                ofmt->sectalign(location.segment, 32);
+            }
         }
         break;
     }
@@ -342,6 +346,9 @@ bool process_directives(char *directive)
             e = evaluate(stdscan, NULL, &tokval, NULL, true, NULL);
             if (e) {
                 uint64_t align = e->value;
+                if (lfi_mode && align < 32) {
+                    align = 32;
+                }
 
 		if (!is_power2(e->value)) {
                     nasm_nonfatal("segment alignment `%s' is not power of two",

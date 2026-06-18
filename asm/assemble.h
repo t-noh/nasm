@@ -9,6 +9,7 @@
 #define NASM_ASSEMBLE_H
 
 #include "nasm.h"
+#include "asm/lfi.h"
 #include "iflag.h"
 #include "asmutil.h"
 
@@ -20,6 +21,8 @@ extern struct location absolute;
 
 int64_t increment_offset(int64_t delta);
 void process_insn(insn *instruction);
+void process_one_insn(insn *instruction);
+int64_t insn_size(insn *instruction);
 
 bool directive_valid(const char *);
 bool process_directives(char *);

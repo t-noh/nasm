@@ -575,6 +575,11 @@ void backend_label(const char *label, int32_t segment, int64_t offset)
     define_label(label, segment, offset, false);
 }
 
+bool is_local_label(const char* label)
+{
+    return islocal(label);
+}
+
 int init_labels(void)
 {
     ldata = lfree = nasm_malloc(LBLK_SIZE);

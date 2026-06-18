@@ -502,6 +502,10 @@ extern struct strlist *depend_list;
 
 /* TASM mode changes some properties */
 extern bool tasm_compatible_mode;
+extern bool lfi_mode;
+extern bool lfi_no_segue;
+extern bool lfi_no_loads;
+extern bool lfi_no_stores;
 
 /*
  * inline function to skip past an identifier; returns the first character past

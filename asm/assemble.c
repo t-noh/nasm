@@ -73,7 +73,7 @@ enum match_result {
         (((mod) << 6) | (((reg) & 7) << 3) | ((rm) & 7))
 
 static int64_t assemble(insn *instruction);
-static int64_t insn_size(insn *instruction);
+int64_t insn_size(insn *instruction);
 
 static int64_t calcsize(insn *);
 static int64_t calcsize_speculative(const insn *, const struct itemplate *);
@@ -1243,7 +1243,7 @@ static int64_t len_extops(const extop *e)
     return isize;
 }
 
-static int64_t insn_size(insn *instruction)
+int64_t insn_size(insn *instruction)
 {
     enum match_result m;
     int64_t isize = 0;
@@ -4061,7 +4061,7 @@ static inline void list_nonfinal_pass(int64_t start)
  * Process a single instruction without TIMES; this is a common case
  * so optimize it.
  */
-static void process_one_insn(insn *ins)
+void process_one_insn(insn *ins)
 {
     int64_t l;
 
@@ -4145,14 +4145,18 @@ static void process_times_insn(insn *ins)
  */
 void process_insn(insn *ins)
 {
-    if (likely(ins->times == 1)) {
-        process_one_insn(ins);
-    } else if (!ins->times) {
-        /* TIMES 0 = nothing to do */
-    } else if (likely(ins->times > 0)) {
-        process_times_insn(ins);
+    if (lfi_mode) {
+        lfi_process_insn(ins);
     } else {
-        nasm_nonfatalf(ERR_PASS2, "TIMES value %"PRId32" is negative",
-                       ins->times);
+        if (likely(ins->times == 1)) {
+            process_one_insn(ins);
+        } else if (!ins->times) {
+            /* TIMES 0 = nothing to do */
+        } else if (likely(ins->times > 0)) {
+            process_times_insn(ins);
+        } else {
+            nasm_nonfatalf(ERR_PASS2, "TIMES value %"PRId32" is negative",
+                           ins->times);
+        }
     }
 }

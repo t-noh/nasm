@@ -33,6 +33,7 @@ void backend_label(const char *label, int32_t segment, int64_t offset);
 bool declare_label(const char *label, enum label_type type,
                    const char *special);
 void set_label_mangle(enum directive which, const char *what);
+bool is_local_label(const char* label);
 int init_labels(void);
 void cleanup_labels(void);
 const char *local_scope(const char *label);

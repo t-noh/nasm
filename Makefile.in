@@ -192,7 +192,7 @@ LIBOBJ_ASM = \
 	asm/floats.$(O) \
 	asm/directiv.$(O) \
 	asm/pragma.$(O) \
-	asm/assemble.$(O) asm/labels.$(O) asm/parser.$(O) \
+	asm/assemble.$(O) asm/lfi.$(O) asm/labels.$(O) asm/parser.$(O) \
 	asm/preproc.$(O) asm/quote.$(O) \
 	asm/listing.$(O) asm/eval.$(O) asm/exprlib.$(O) asm/exprdump.$(O) \
 	asm/stdscan.$(O) \

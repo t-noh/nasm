@@ -9,6 +9,7 @@
 
 
 #include "nasm.h"
+#include "asm/lfi.h"
 #include "nasmlib.h"
 #include "nctype.h"
 #include "error.h"
@@ -59,6 +60,10 @@ static bool abort_on_panic = ABORT_ON_PANIC;
 static bool keep_all;
 
 bool tasm_compatible_mode = false;
+bool lfi_mode = false;
+bool lfi_no_segue = false;
+bool lfi_no_loads = false;
+bool lfi_no_stores = false;
 enum pass_type _pass_type;
 const char * const _pass_types[] =
 {
@@ -1160,9 +1165,29 @@ static bool process_arg(char *p, char *q, int pass)
                 strlist_add(include_path, param);
             break;
 
-        case 'l':       /* listing file */
-            if (pass == 2)
-                copy_filename(&listname, param, "listing");
+        case 'l':       /* listing file or -lfi* flags */
+            if (strcmp(p, "-lfi") == 0) {
+                if (pass == 1)
+                    lfi_mode = true;
+            } else if (strcmp(p, "-lfi-no-segue") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_no_segue = true;
+                }
+            } else if (strcmp(p, "-lfi-no-loads") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_no_loads = true;
+                }
+            } else if (strcmp(p, "-lfi-no-stores") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_no_stores = true;
+                }
+            } else {
+                if (pass == 2)
+                    copy_filename(&listname, param, "listing");
+            }
             break;
 
         case 'L':        /* listing options */
@@ -1789,6 +1814,7 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
                 goto end_of_line; /* Just do final cleanup */
 
             /* Not a directive, or even something that starts with [ */
+            lfi_align_label_if_needed(line);
             parse_line(line, &output_ins, globl.bits);
             forward_refs(&output_ins);
             process_insn(&output_ins);
@@ -2085,6 +2111,7 @@ static void help(FILE *out, const char *what)
     if (help_opt(with)) {
         fputs(
             "    -t             assemble in limited SciTech TASM compatible mode\n"
+            "    -lfi           assemble in LFI sandboxed mode\n"
             "    -E (or -e)     preprocess only (writes output to stdout by default)\n"
             "    -a             don't preprocess (assemble only)\n"
             "    -Ipath         add a pathname to the include file path\n"
