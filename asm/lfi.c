@@ -1220,39 +1220,26 @@ static bool check_is_label(char *buffer)
         }
     }
 
-    if (i != TOKEN_ID &&
-        i != TOKEN_INSN &&
-        i != TOKEN_PREFIX &&
-        (i != TOKEN_REG || !IS_SREG(local_tokval.t_integer))) {
-        return false;
-    }
-
     if (i == TOKEN_ID) {
-        i = stdscan(NULL, &local_tokval);
-        if (i == ':') {
-            i = stdscan(NULL, &local_tokval);
-        }
-    }
-
-    if (i == TOKEN_EOS || (local_tokval.t_charptr && strcmp("function", local_tokval.t_charptr) == 0))
-        return true;
-
-    while (i == TOKEN_PREFIX ||
-           (i == TOKEN_REG && IS_SREG(local_tokval.t_integer))) {
-        i = stdscan(NULL, &local_tokval);
-    }
-
-    if (local_tokval.t_integer == I_none) {
-        return true;
+        return true; /* Any user-defined identifier at the start of a line defines a label! */
     }
 
     return false;
 }
 
+/* Helper to check if a string (skipping leading whitespace) represents a local label */
+static bool is_local_label_string(const char *l)
+{
+    while (*l == ' ' || *l == '\t') {
+        l++;
+    }
+    return is_local_label(l);
+}
+
 /* Align label to 32-byte boundary if needed for LFI */
 void lfi_align_label_if_needed(char *line)
 {
-    if (lfi_mode && check_is_label(line) && !is_local_label(line)) {
+    if (lfi_mode && check_is_label(line) && !is_local_label_string(line)) {
         int paddingRequired = (32 - (location.offset % 32)) % 32;
         if (paddingRequired > 0) {
             insn padding_ins;
