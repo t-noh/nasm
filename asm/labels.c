@@ -455,7 +455,7 @@ void define_label(const char *label, int32_t segment,
 {
     union label *lptr;
 
-    if (lfi_mode && segment && !is_local_label(label)) {
+    if (lfi_mode && segment && lfi_is_code_segment(segment) && !is_local_label(label)) {
         int paddingRequired = (32 - (offset % 32)) % 32;
         if (paddingRequired > 0) {
             lfi_emit_nops(segment, paddingRequired);

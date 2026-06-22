@@ -1796,7 +1796,11 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
         if (pass_first())
             location.known = true;
         ofmt->reset();
-        switch_segment(ofmt->section(NULL, &globl.bits));
+        int32_t def_seg = ofmt->section(NULL, &globl.bits);
+        switch_segment(def_seg);
+        if (lfi_mode) {
+            lfi_register_section(def_seg, NULL);
+        }
         pp_reset(fname, PP_NORMAL, depend_list);
 
         globallineno = 0;

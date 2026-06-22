@@ -330,6 +330,7 @@ bool process_directives(char *directive)
             globl.bits = sb;
             switch_segment(seg);
             if (lfi_mode) {
+                lfi_register_section(seg, value);
                 ofmt->sectalign(location.segment, 32);
             }
         }

@@ -1115,9 +1115,13 @@ static int get_bundle_padsize(int64_t offset, int minSpaceInCurrBlock, int64_t r
     return 0; /* Satisfy compiler */
 }
 
-/* Process an instruction under LFI sandboxing rules */
 void lfi_process_insn(insn *ins)
 {
+    if (!lfi_is_code_segment(location.segment)) {
+        process_one_insn(ins);
+        return;
+    }
+
     int rewriteCount = 0;
     insn rewrittenInsns[16];
     memset(rewrittenInsns, 0, sizeof(rewrittenInsns));
@@ -1237,4 +1241,49 @@ void lfi_emit_nops(int32_t segment, int count)
 
     /* 2. Advance the assembler's global location counter */
     location.offset += count;
+}
+
+/* Global array to track which segment IDs contain executable code.
+ * NASM segment IDs are positive even integers, so 65536 covers IDs up to 131072. */
+#define LFI_MAX_SECTIONS 65536
+static bool lfi_is_code_seg[LFI_MAX_SECTIONS];
+
+void lfi_register_section(int32_t seg, const char *value)
+{
+    if (seg <= 0 || seg >= LFI_MAX_SECTIONS)
+        return;
+
+    if (!value) {
+        /* Default section is always code (.text) */
+        lfi_is_code_seg[seg] = true;
+        return;
+    }
+
+    /* Check if the section name or attributes indicate it contains executable code.
+     * We look for ".text" or the keywords "code" or "exec" (case-insensitive). */
+    bool is_code = false;
+
+    /* 1. Check if it starts with ".text" */
+    if (strncmp(value, ".text", 5) == 0) {
+        is_code = true;
+    } else {
+        /* 2. Case-insensitive search for "code" or "exec" */
+        for (const char *p = value; *p; p++) {
+            if (strncasecmp(p, "code", 4) == 0 || strncasecmp(p, "exec", 4) == 0) {
+                is_code = true;
+                break;
+            }
+        }
+    }
+
+    if (is_code) {
+        lfi_is_code_seg[seg] = true;
+    }
+}
+
+bool lfi_is_code_segment(int32_t seg)
+{
+    if (seg <= 0 || seg >= LFI_MAX_SECTIONS)
+        return false;
+    return lfi_is_code_seg[seg];
 }

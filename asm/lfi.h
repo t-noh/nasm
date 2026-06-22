@@ -10,5 +10,7 @@ extern bool lfi_mode;
 
 void lfi_process_insn(insn *ins);
 void lfi_emit_nops(int32_t segment, int count);
+void lfi_register_section(int32_t seg, const char *value);
+bool lfi_is_code_segment(int32_t seg);
 
 #endif /* NASM_LFI_H */
