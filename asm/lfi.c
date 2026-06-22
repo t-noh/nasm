@@ -180,6 +180,8 @@ static bool is_x87_insn_with_mem(insn *ins)
     return false;
 }
 
+
+
 /* Determine if the memory operand at mem_index is a load (read) operation */
 static bool is_memload(insn *ins, int mem_index)
 {
@@ -702,6 +704,38 @@ static void rewrite_tlswrite(insn *ins, int mem_index, int *count, insn *ret)
     parse_insn_ops(ins, &(ret[1]), opsStr[0], opsStr[1], opsStr[2]);
 }
 
+static bool uses_r15_invalidly(insn *ins)
+{
+    for (int i = 0; i < ins->operands; i++) {
+        operand *op = &ins->oprs[i];
+
+        /* Register Operand: R15 is strictly forbidden (prevents context pointer copy bypasses) */
+        if (is_op_type(*op, REGISTER)) {
+            enum reg_enum parent = get_64bit_parent(op->basereg);
+            if (parent == LFI_CTXREG) {
+                return true;
+            }
+        }
+
+        /* Memory Operand: R15 is allowed ONLY as a base register with offset 32 */
+        if (is_op_type(*op, MEMORY)) {
+            if (op->basereg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->basereg);
+                if (parent == LFI_CTXREG && op->offset != 32) {
+                    return true;
+                }
+            }
+            if (op->indexreg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->indexreg);
+                if (parent == LFI_CTXREG) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /* =========================================================================
  * 3. Instruction Classification Predicates
  * ========================================================================= */
@@ -760,12 +794,15 @@ static bool is_stack_mod(insn *ins)
 
 static bool modifies_reserved_reg(insn *ins, enum reg_enum reg)
 {
-    /* Simple check to prevent modifications of R14 base register */
+    enum reg_enum parent_reg = get_64bit_parent(reg);
     for (int i = 0; i < ins->operands; i++) {
-        if (is_op_type(ins->oprs[i], REGISTER) && ins->oprs[i].basereg == reg) {
-            /* If it is a destination operand in a register-modifying instruction */
-            if (i == 0 && ins->opcode != I_CMP && ins->opcode != I_TEST) {
-                return true;
+        if (is_op_type(ins->oprs[i], REGISTER)) {
+            enum reg_enum op_parent = get_64bit_parent(ins->oprs[i].basereg);
+            if (op_parent == parent_reg) {
+                /* If it is a destination operand in a register-modifying instruction */
+                if (i == 0 && ins->opcode != I_CMP && ins->opcode != I_TEST) {
+                    return true;
+                }
             }
         }
     }
@@ -1031,9 +1068,19 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
         nasm_fatal("LFI: LFI mode is only supported for the elf64 output format");
     }
 
-    /* Check for modification of reserved register R14 */
+    /* 1. Check for illegal modification of R14 (sandbox base) */
     if (modifies_reserved_reg(ins, LFI_SBX_BASE)) {
         nasm_fatal("LFI: illegal modification of reserved LFI register %%r14");
+    }
+
+    /* 2. Check for illegal modification of R11 (scratch register) */
+    if (modifies_reserved_reg(ins, LFI_SCRATCH_REG)) {
+        nasm_fatal("LFI: illegal modification of reserved LFI register %%r11");
+    }
+
+    /* 3. Check for illegal uses of R15 (context register) */
+    if (uses_r15_invalidly(ins)) {
+        nasm_fatal("LFI: illegal use of reserved LFI context register %%r15");
     }
 
     /* Dispatch based on instruction type, matching LLVM X86MCLFIRewriter.cpp */
@@ -1121,6 +1168,8 @@ void lfi_process_insn(insn *ins)
         process_one_insn(ins);
         return;
     }
+
+
 
     int rewriteCount = 0;
     insn rewrittenInsns[16];
