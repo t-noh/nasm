@@ -1813,8 +1813,6 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
             if (process_directives(line))
                 goto end_of_line; /* Just do final cleanup */
 
-            /* Not a directive, or even something that starts with [ */
-            lfi_align_label_if_needed(line);
             parse_line(line, &output_ins, globl.bits);
             forward_refs(&output_ins);
             process_insn(&output_ins);

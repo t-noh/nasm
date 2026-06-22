@@ -1201,54 +1201,40 @@ void lfi_process_insn(insn *ins)
     }
 }
 
-/* Scans the line to check if it defines a label */
-static bool check_is_label(char *buffer)
+/* Low-level NOP emitter for LFI label alignment */
+void lfi_emit_nops(int32_t segment, int count)
 {
-    int i;
-    struct tokenval local_tokval;
+    if (count <= 0)
+        return;
 
-    stdscan_reset(buffer);
-    i = stdscan(NULL, &local_tokval);
+    /* 1. In the final pass, write the actual NOP bytes to the output format */
+    if (pass_final()) {
+        struct out_data odata;
+        memset(&odata, 0, sizeof(odata));
+        odata.loc = location; /* Write to current unaligned offset */
+        odata.loc.segment = segment; /* Explicitly use the segment being defined */
+        odata.type = OUT_RAWDATA;
+        odata.size = count;
 
-    if (i == TOKEN_EOS)
-        return false;
+        /* Create a buffer of NOPs */
+        uint8_t *nop_buf = nasm_malloc(count);
+        memset(nop_buf, 0x90, count);
+        odata.data = nop_buf;
 
-    if (i == '[') {
-        i = stdscan(NULL, &local_tokval);
-        if (local_tokval.t_charptr && strcmp("global", local_tokval.t_charptr) == 0) {
-            i = stdscan(NULL, &local_tokval);
-        }
+        odata.tsegment = NO_SEG;
+        odata.twrt = NO_SEG;
+
+        /* Legacy translation required by NASM backends */
+        odata.legacy.data = odata.data;
+        odata.legacy.type = odata.type;
+        odata.legacy.size = odata.size;
+        odata.legacy.tsegment = odata.tsegment;
+        odata.legacy.twrt = odata.twrt;
+
+        ofmt->output(&odata);
+        nasm_free(nop_buf);
     }
 
-    if (i == TOKEN_ID) {
-        return true; /* Any user-defined identifier at the start of a line defines a label! */
-    }
-
-    return false;
-}
-
-/* Helper to check if a string (skipping leading whitespace) represents a local label */
-static bool is_local_label_string(const char *l)
-{
-    while (*l == ' ' || *l == '\t') {
-        l++;
-    }
-    return is_local_label(l);
-}
-
-/* Align label to 32-byte boundary if needed for LFI */
-void lfi_align_label_if_needed(char *line)
-{
-    if (lfi_mode && check_is_label(line) && !is_local_label_string(line)) {
-        int paddingRequired = (32 - (location.offset % 32)) % 32;
-        if (paddingRequired > 0) {
-            insn padding_ins;
-            char paddingInstruction[128];
-            sprintf(paddingInstruction, "times %d nop", paddingRequired);
-
-            parse_line(paddingInstruction, &padding_ins, globl.bits);
-            process_insn(&padding_ins);
-            cleanup_insn(&padding_ins);
-        }
-    }
+    /* 2. Advance the assembler's global location counter */
+    location.offset += count;
 }

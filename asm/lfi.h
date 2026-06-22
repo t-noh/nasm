@@ -9,6 +9,6 @@
 extern bool lfi_mode;
 
 void lfi_process_insn(insn *ins);
-void lfi_align_label_if_needed(char *line);
+void lfi_emit_nops(int32_t segment, int count);
 
 #endif /* NASM_LFI_H */

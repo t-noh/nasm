@@ -13,6 +13,7 @@
 #include "error.h"
 #include "hashtbl.h"
 #include "labels.h"
+#include "lfi.h"
 
 /*
  * A dot-local label is one that begins with exactly one period. Things
@@ -453,6 +454,14 @@ void define_label(const char *label, int32_t segment,
                   int64_t offset, bool normal)
 {
     union label *lptr;
+
+    if (lfi_mode && segment && !is_local_label(label)) {
+        int paddingRequired = (32 - (offset % 32)) % 32;
+        if (paddingRequired > 0) {
+            lfi_emit_nops(segment, paddingRequired);
+            offset += paddingRequired;
+        }
+    }
     bool created, changed, largechange;
     int64_t size;
     int64_t lpass, lastdef;
