@@ -64,6 +64,7 @@ bool lfi_mode = false;
 bool lfi_no_segue = false;
 bool lfi_no_loads = false;
 bool lfi_no_stores = false;
+bool lfi_warn_only = false;
 enum pass_type _pass_type;
 const char * const _pass_types[] =
 {
@@ -1183,6 +1184,11 @@ static bool process_arg(char *p, char *q, int pass)
                 if (pass == 1) {
                     lfi_mode = true;
                     lfi_no_stores = true;
+                }
+            } else if (strcmp(p, "-lfi-warn-only") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_warn_only = true;
                 }
             } else {
                 if (pass == 2)

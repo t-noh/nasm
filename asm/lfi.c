@@ -29,6 +29,30 @@
 #define regName(reg) (nasm_reg_names[reg-EXPR_REG_START])
 
 /*
+ * Unified LFI error and warning reporting helper.
+ *
+ * Under strict mode (default), it routes errors to nasm_fatal or nasm_nonfatal.
+ * Under permissive mode (-lfi-warn-only), it maps all errors to warnings,
+ * allowing compilation to continue, instructions to be emitted, and the build to succeed.
+ */
+static void lfi_report_error(bool is_fatal, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    if (lfi_warn_only) {
+        nasm_error(ERR_WARNING | WARN_OTHER, "%s", buf);
+    } else if (is_fatal) {
+        nasm_fatal("%s", buf);
+    } else {
+        nasm_nonfatal("%s", buf);
+    }
+}
+
+/*
  * Helper to parse a formatted string into a NASM instruction.
  * Eliminates the need for local character buffers and manual sprintf.
  */
@@ -1070,17 +1094,17 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
 
     /* 1. Check for illegal modification of R14 (sandbox base) */
     if (modifies_reserved_reg(ins, LFI_SBX_BASE)) {
-        nasm_fatal("LFI: illegal modification of reserved LFI register %%r14");
+        lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r14");
     }
 
     /* 2. Check for illegal modification of R11 (scratch register) */
     if (modifies_reserved_reg(ins, LFI_SCRATCH_REG)) {
-        nasm_fatal("LFI: illegal modification of reserved LFI register %%r11");
+        lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r11");
     }
 
     /* 3. Check for illegal uses of R15 (context register) */
     if (uses_r15_invalidly(ins)) {
-        nasm_fatal("LFI: illegal use of reserved LFI context register %%r15");
+        lfi_report_error(true, "LFI: illegal use of reserved LFI context register %%r15");
     }
 
     /* Dispatch based on instruction type, matching LLVM X86MCLFIRewriter.cpp */
@@ -1106,7 +1130,7 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
     } else {
         /* Check for invalid use of GS segment in general instructions */
         if (uses_gs_invalidly(ins)) {
-            nasm_fatal("LFI: invalid use of %%gs segment register");
+            lfi_report_error(true, "LFI: invalid use of %%gs segment register");
         }
         expand_load_store(ins, count, ret, bundle_lock_mask);
     }
@@ -1121,12 +1145,12 @@ static int get_bundle_padsize(int64_t offset, int minSpaceInCurrBlock, int64_t r
 {
     if (ofmt == &of_elf64) {
         if (rawInstrSize >= 32) {
-            nasm_nonfatal("LFI: Instruction size greater than or equal to 32");
+            lfi_report_error(false, "LFI: Instruction size greater than or equal to 32");
             return 0;
         }
 
         if (minSpaceInCurrBlock > 32) {
-            nasm_nonfatal("LFI: More than 32 bytes of instructions that can't be separated");
+            lfi_report_error(false, "LFI: More than 32 bytes of instructions that can't be separated");
             return 0;
         }
 
