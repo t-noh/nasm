@@ -60,10 +60,12 @@ mov [rel foo], rax
 
 ; R14 (sandbox base) access is safe
 mov rax, [r14]
-; CHECK: mov rax,qword ptr [r14]
+; CHECK:      mov r11,qword ptr [r15+0x30]
+; CHECK-NEXT: mov rax,qword ptr gs:[r11d]
 
 mov rax, [r14 + 8]
-; CHECK: mov rax,qword ptr [r14+0x8]
+; CHECK:      mov r11,qword ptr [r15+0x30]
+; CHECK-NEXT: mov rax,qword ptr gs:[r11d+0x8]
 
 ; Different data sizes
 mov edi, [rax]

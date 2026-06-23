@@ -141,6 +141,9 @@ static bool is_ea_flags(operand op, int flags)
     return (op.eaflags & flags) == flags;
 }
 
+/* File-scope tracker to determine if R15 is used as a general-purpose register in the current file */
+static bool lfi_r15_used_as_gpr = false;
+
 /* Check if a memory operand is inherently safe (does not require sandboxing) */
 static bool is_safe_memop(operand *op)
 {
@@ -151,8 +154,13 @@ static bool is_safe_memop(operand *op)
         return false; /* Any index register makes it unsafe and requires truncation/sandboxing */
     }
     enum reg_enum base = op->basereg;
-    if (base == R_RSP || base == R_RBP || base == LFI_SBX_BASE || base == LFI_CTXREG) {
-        return true; /* Simple offset from stack, frame, or base registers is safe */
+    if (base == R_RSP || base == R_RBP) {
+        return true; /* Stack and frame pointer accesses are always safe */
+    }
+    /* Context register access is only safe as a physical TLS access (offset 32)
+     * and only if R15 is not being used as a general-purpose register in this file. */
+    if (base == LFI_CTXREG && !lfi_r15_used_as_gpr && op->offset == 32) {
+        return true;
     }
     return false;
 }
@@ -221,18 +229,6 @@ static bool is_memload(insn *ins, int mem_index)
     return false;
 }
 
-/* Format a non-memory operand (register or immediate) as a string */
-static void get_operand_string_rep(operand *op, char *dest)
-{
-    if (is_op_type(*op, REGISTER)) {
-        strcpy(dest, regName(op->basereg));
-    } else if (is_op_type(*op, IMMEDIATE)) {
-        sprintf(dest, "%ld", op->offset);
-    } else {
-        strcpy(dest, "");
-    }
-}
-
 /* Helper to get the NASM size specifier string (e.g. "qword ", "dword ", etc.) */
 static const char *get_operand_size_specifier(operand *op)
 {
@@ -245,6 +241,57 @@ static const char *get_operand_size_specifier(operand *op)
     if (type & BITS256) return "yword ";
     if (type & BITS512) return "zword ";
     return ""; /* Default: no size specifier */
+}
+
+/* Helper to format a normal memory operand (without GS segment override) */
+static void get_normal_memstr(operand *op, char *dest)
+{
+    const char *sizeSpec = get_operand_size_specifier(op);
+    const char *base_name = (op->basereg != R_none) ? regName(op->basereg) : NULL;
+    const char *index_name = (op->indexreg != R_none) ? regName(op->indexreg) : NULL;
+
+    char base_part[64] = "";
+    if (base_name) {
+        strcpy(base_part, base_name);
+    }
+
+    char index_part[64] = "";
+    if (index_name) {
+        const char *plus = (base_name) ? "+" : "";
+        if (op->scale > 1) {
+            sprintf(index_part, "%s%s*%d", plus, index_name, op->scale);
+        } else {
+            sprintf(index_part, "%s%s", plus, index_name);
+        }
+    }
+
+    char offset_part[64] = "";
+    if (op->offset != 0 || (!base_name && !index_name)) {
+        const char *plus = (base_name || index_name) ? "+" : "";
+        if (op->offset > 0) {
+            sprintf(offset_part, "%s%ld", plus, op->offset);
+        } else if (op->offset < 0) {
+            sprintf(offset_part, "%ld", op->offset);
+        } else {
+            strcpy(offset_part, "0");
+        }
+    }
+
+    sprintf(dest, "%s[%s%s%s]", sizeSpec, base_part, index_part, offset_part);
+}
+
+/* Format an operand (register, immediate, or memory) as a string */
+static void get_operand_string_rep(operand *op, char *dest)
+{
+    if (is_op_type(*op, REGISTER)) {
+        strcpy(dest, regName(op->basereg));
+    } else if (is_op_type(*op, IMMEDIATE)) {
+        sprintf(dest, "%ld", op->offset);
+    } else if (is_op_type(*op, MEMORY)) {
+        get_normal_memstr(op, dest); /* Support memory operands! */
+    } else {
+        strcpy(dest, "");
+    }
 }
 
 /* Format a sandboxed memory reference string using GS segment and 32-bit registers */
@@ -1082,6 +1129,315 @@ bypass:
     return;
 }
 
+/* Determine virtual offset and size prefix for a virtualized register */
+static bool get_virtual_reg_info(enum reg_enum reg, int *offset, const char **size_prefix)
+{
+    enum reg_enum parent = get_64bit_parent(reg);
+    if (parent == LFI_SCRATCH_REG) {
+        *offset = 40;
+    } else if (parent == LFI_SBX_BASE) {
+        *offset = 48;
+    } else if (parent == LFI_CTXREG) {
+        *offset = 56;
+    } else {
+        return false;
+    }
+
+    switch (reg) {
+        case R_R11: case R_R14: case R_R15:
+            *size_prefix = "qword";
+            break;
+        case R_R11D: case R_R14D: case R_R15D:
+            *size_prefix = "dword";
+            break;
+        case R_R11W: case R_R14W: case R_R15W:
+            *size_prefix = "word";
+            break;
+        case R_R11B: case R_R14B: case R_R15B:
+            *size_prefix = "byte";
+            break;
+        default:
+            *size_prefix = "qword";
+            break;
+    }
+    return true;
+}
+
+/* Map to the corresponding size of the physical scratch register R11 */
+static enum reg_enum get_physical_scratch(enum reg_enum size_ref_reg)
+{
+    switch (size_ref_reg) {
+        case R_R11: case R_R14: case R_R15:
+        case R_RAX: case R_RBX: case R_RCX: case R_RDX:
+        case R_RSI: case R_RDI: case R_RBP: case R_RSP:
+        case R_R8:  case R_R9:  case R_R10: case R_R12: case R_R13:
+            return R_R11;
+        case R_R11D: case R_R14D: case R_R15D:
+        case R_EAX: case R_EBX: case R_ECX: case R_EDX:
+        case R_ESI: case R_EDI: case R_EBP: case R_ESP:
+        case R_R8D:  case R_R9D:  case R_R10D: case R_R12D: case R_R13D:
+            return R_R11D;
+        case R_R11W: case R_R14W: case R_R15W:
+        case R_AX: case R_BX: case R_CX: case R_DX:
+        case R_SI: case R_DI: case R_BP: case R_SP:
+        case R_R8W:  case R_R9W:  case R_R10W: case R_R12W: case R_R13W:
+            return R_R11W;
+        case R_R11B: case R_R14B: case R_R15B:
+        case R_AL: case R_BL: case R_CL: case R_DL:
+        case R_SIL: case R_DIL: case R_BPL: case R_SPL:
+        case R_R8B:  case R_R9B:  case R_R10B: case R_R12B: case R_R13B:
+            return R_R11B;
+        default:
+            return R_R11;
+    }
+}
+
+/* Check if an instruction needs register virtualization */
+static bool needs_reg_virtualization(insn *ins)
+{
+    /* First, scan for explicit GPR uses of r15 to activate file-scope GPR mode.
+     * Since NASM is invoked once per file, this static tracker naturally resets per file. */
+    if (!lfi_r15_used_as_gpr) {
+        for (int i = 0; i < ins->operands; i++) {
+            operand *op = &ins->oprs[i];
+            if (is_op_type(*op, REGISTER)) {
+                if (get_64bit_parent(op->basereg) == LFI_CTXREG) {
+                    lfi_r15_used_as_gpr = true;
+                    break;
+                }
+            }
+            if (is_op_type(*op, MEMORY)) {
+                if (op->basereg != R_none && get_64bit_parent(op->basereg) == LFI_CTXREG && op->offset != 32) {
+                    lfi_r15_used_as_gpr = true;
+                    break;
+                }
+                if (op->indexreg != R_none && get_64bit_parent(op->indexreg) == LFI_CTXREG) {
+                    lfi_r15_used_as_gpr = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < ins->operands; i++) {
+        operand *op = &ins->oprs[i];
+
+        /* 1. Register Operands: r11, r14, r15 all need virtualization */
+        if (is_op_type(*op, REGISTER)) {
+            enum reg_enum parent = get_64bit_parent(op->basereg);
+            if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                return true;
+            }
+        }
+
+        /* 2. Check Memory Operands: r11, r14, and r15 need virtualization in memory operands.
+         * If r15 is used as a GPR in the file, we virtualize ALL its memory accesses (including offset 32).
+         * Otherwise, we only virtualize if offset != 32. */
+        if (is_op_type(*op, MEMORY)) {
+            if (op->basereg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->basereg);
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE) {
+                    return true;
+                }
+                if (parent == LFI_CTXREG) {
+                    if (lfi_r15_used_as_gpr || op->offset != 32) {
+                        return true;
+                    }
+                }
+            }
+            if (op->indexreg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->indexreg);
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/* Helper to format an operand, sandboxing memory operands inline to prevent LFI bypasses */
+static void format_operand_sandboxed(insn *ins, int op_idx, char *dest)
+{
+    operand *op = &ins->oprs[op_idx];
+    if (is_op_type(*op, MEMORY)) {
+        /* If it is a safe memory operand (stack or RIP-relative), do not sandbox it! */
+        if (is_safe_memop(op)) {
+            get_normal_memstr(op, dest);
+        } else {
+            /* Segue Mode: Use GS segment override */
+            if (!lfi_no_segue) {
+                get_segue_memstr(op, dest);
+            }
+            /* No-Segue Mode: Format relative to SBX_BASE (r14) + SCRATCH (r11) */
+            else {
+                get_explicit_memstr(op, LFI_SBX_BASE, LFI_SCRATCH_REG, 1, 0, dest);
+            }
+        }
+    } else {
+        get_operand_string_rep(op, dest);
+    }
+}
+
+/* Helper to find the index of the first unsafe memory operand in an instruction */
+static int get_unsafe_mem_op_index(insn *ins)
+{
+    for (int i = 0; i < ins->operands; i++) {
+        if (is_op_type(ins->oprs[i], MEMORY) && !is_safe_memop(&ins->oprs[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Helper to emit No-Segue address calculation if needed */
+static void maybe_emit_nosegue_addr(insn *ins, int *out_idx, insn *ret)
+{
+    if (lfi_no_segue) {
+        int mem_idx = get_unsafe_mem_op_index(ins);
+        if (mem_idx != -1) {
+            char addressCalcStr[1024];
+            const char *scratch32 = get_32bit_reg_name(LFI_SCRATCH_REG);
+            get_nosegue_addr(&ins->oprs[mem_idx], scratch32, addressCalcStr);
+            parse_line(addressCalcStr, &(ret[(*out_idx)++]), ins->bits);
+        }
+    }
+}
+
+/* Perform register virtualization expansion */
+static void expand_virtual_regs(insn *ins, int *count, insn *ret)
+{
+    int bits = ins->bits;
+    int out_idx = 0;
+
+    bool preloaded_scratch = false;
+    int scratch_offset = 0;
+
+    /* 1. Pre-load virtual r11/r14/r15 into physical scratch r11 for memory operands,
+     * and rewrite the memory operands to use physical r11. */
+    for (int i = 0; i < ins->operands; i++) {
+        operand *op = &ins->oprs[i];
+        if (is_op_type(*op, MEMORY)) {
+            if (op->basereg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->basereg);
+                if ((parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || (parent == LFI_CTXREG && (op->offset != 32 || lfi_r15_used_as_gpr))) && !preloaded_scratch) {
+                    const char *dummy_size;
+                    get_virtual_reg_info(op->basereg, &scratch_offset, &dummy_size);
+                    /* Generate pre-load: mov r11, [r15 + scratch_offset] */
+                    parse_line_fmt(&(ret[out_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
+                    preloaded_scratch = true;
+                }
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || (parent == LFI_CTXREG && (op->offset != 32 || lfi_r15_used_as_gpr))) {
+                    /* Rewrite AST: replace base register with physical R_R11 */
+                    op->basereg = R_R11;
+                }
+            }
+            if (op->indexreg != R_none) {
+                enum reg_enum parent = get_64bit_parent(op->indexreg);
+                if ((parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) && !preloaded_scratch) {
+                    const char *dummy_size;
+                    get_virtual_reg_info(op->indexreg, &scratch_offset, &dummy_size);
+                    parse_line_fmt(&(ret[out_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
+                    preloaded_scratch = true;
+                }
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                    /* Rewrite AST: replace index register with physical R_R11 */
+                    op->indexreg = R_R11;
+                }
+            }
+        }
+    }
+
+    /* 2. Count register operands needing virtualization */
+    int virtualized_ops_count = 0;
+    int virtualized_op_indices[3];
+    for (int i = 0; i < ins->operands; i++) {
+        if (is_op_type(ins->oprs[i], REGISTER)) {
+            enum reg_enum parent = get_64bit_parent(ins->oprs[i].basereg);
+            if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                virtualized_op_indices[virtualized_ops_count++] = i;
+            }
+        }
+    }
+
+    /* Case A: Virtual-to-Virtual operation (both operands are virtualized) */
+    if (virtualized_ops_count == 2) {
+        int dest_idx = virtualized_op_indices[0];
+        int src_idx = virtualized_op_indices[1];
+        enum reg_enum dest_reg = ins->oprs[dest_idx].basereg;
+        enum reg_enum src_reg = ins->oprs[src_idx].basereg;
+
+        int src_offset, dest_offset;
+        const char *src_size, *dest_size;
+        get_virtual_reg_info(src_reg, &src_offset, &src_size);
+        get_virtual_reg_info(dest_reg, &dest_offset, &dest_size);
+
+        enum reg_enum physical_scratch = get_physical_scratch(src_reg);
+
+        parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, %s [%s + %d]",
+                       regName(physical_scratch), src_size, regName(LFI_CTXREG), src_offset);
+
+        parse_line_fmt(&(ret[out_idx++]), bits, "%s %s [%s + %d], %s",
+                       nasm_insn_names[ins->opcode], dest_size, regName(LFI_CTXREG), dest_offset, regName(physical_scratch));
+    }
+    /* Case B: Standard operation (exactly 1 virtualized register operand)
+     * We use a secure 3-step intermediate redirection via physical scratch R11
+     * to completely bypass all x86 hardware constraints (like pmovmskb [mem] or mov [mem], [mem]). */
+    else if (virtualized_ops_count == 1) {
+        int v_idx = virtualized_op_indices[0];
+        operand *v_op = &ins->oprs[v_idx];
+        enum reg_enum v_reg = v_op->basereg;
+
+        int v_offset;
+        const char *v_size_prefix;
+        get_virtual_reg_info(v_reg, &v_offset, &v_size_prefix);
+
+        enum reg_enum phys_scratch = get_physical_scratch(v_reg);
+        const char *scratch_name = regName(phys_scratch);
+
+        /* Determine if the virtual register is read and/or written */
+        bool is_write = (v_idx == 0 && ins->opcode != I_PUSH && ins->opcode != I_CMP && ins->opcode != I_TEST);
+        bool is_read = (v_idx == 1) || (ins->opcode == I_PUSH) || (v_idx == 0 && ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_PMOVMSKB && ins->opcode != I_POP);
+
+        /* Step 1: If read, load virtual register into physical scratch R11 */
+        if (is_read) {
+            parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, [%s + %d]", scratch_name, regName(LFI_CTXREG), v_offset);
+        }
+
+        /* Step 2: Rewrite the instruction operand to use physical scratch R11, and parse it.
+         * We also perform inline sandboxing of any memory operands to prevent LFI bypasses! */
+        maybe_emit_nosegue_addr(ins, &out_idx, ret);
+
+        char opsStr[3][256];
+        for (int i = 0; i < ins->operands; i++) {
+            if (i == v_idx) {
+                strcpy(opsStr[i], scratch_name);
+            } else {
+                format_operand_sandboxed(ins, i, opsStr[i]);
+            }
+        }
+        parse_insn_ops(ins, &(ret[out_idx++]), opsStr[0], opsStr[1], opsStr[2]);
+
+        /* Step 3: If written, save physical scratch R11 back to virtual register slot */
+        if (is_write) {
+            parse_line_fmt(&(ret[out_idx++]), bits, "mov [%s + %d], %s", regName(LFI_CTXREG), v_offset, scratch_name);
+        }
+    }
+    /* Case C: Only memory operands were virtualized (0 virtualized register operands)
+     * We just format and parse the instruction normally (which now correctly uses physical R11). */
+    else {
+        maybe_emit_nosegue_addr(ins, &out_idx, ret);
+
+        char opsStr[3][256];
+        for (int i = 0; i < ins->operands; i++) {
+            format_operand_sandboxed(ins, i, opsStr[i]);
+        }
+        parse_insn_ops(ins, &(ret[out_idx++]), opsStr[0], opsStr[1], opsStr[2]);
+    }
+
+    *count = out_idx;
+}
+
 /*
  * High-level driver to replace instructions with LFI sandboxed sequences.
  * Dispatches to specialized expand modules matching the LLVM rewriter's structure.
@@ -1090,6 +1446,16 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
 {
     if (ofmt != &of_elf64) {
         nasm_fatal("LFI: LFI mode is only supported for the elf64 output format");
+    }
+
+    /* STEP 0: Virtualize reserved registers (r11, r14, r15) if they are used by the user's code.
+     * This transparently redirects them to thread-local context memory offsets. */
+    if (needs_reg_virtualization(ins)) {
+        expand_virtual_regs(ins, count, ret);
+        /* Bundle-lock the entire expanded sequence to prevent instructions from being split across
+         * bundle boundaries or targeted individually. Formula: (1 << count) - 2 sets bits 1..count-1. */
+        *bundle_lock_mask = (1 << *count) - 2;
+        return;
     }
 
     /* 1. Check for illegal modification of R14 (sandbox base) */
