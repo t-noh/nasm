@@ -1448,6 +1448,14 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
         nasm_fatal("LFI: LFI mode is only supported for the elf64 output format");
     }
 
+    /* Relax all short jumps to near/auto jumps. Since LFI sandboxing expands instructions
+     * (inserting bundle alignment, pre-loads, and address calculations), short jumps (1-byte offset)
+     * can easily exceed their 127-byte range. Clearing the SHORT flag lets NASM's optimizer
+     * choose the best jump size automatically, preventing out-of-range assembly errors. */
+    for (int i = 0; i < ins->operands; i++) {
+        ins->oprs[i].type &= ~SHORT;
+    }
+
     /* STEP 0: Virtualize reserved registers (r11, r14, r15) if they are used by the user's code.
      * This transparently redirects them to thread-local context memory offsets. */
     if (needs_reg_virtualization(ins)) {
