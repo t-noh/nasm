@@ -147,7 +147,7 @@ static bool lfi_r15_used_as_gpr = false;
 /* Check if a memory operand is inherently safe (does not require sandboxing) */
 static bool is_safe_memop(operand *op)
 {
-    if (is_ea_flags(*op, EAF_REL)) {
+    if (is_ea_flags(*op, EAF_REL) || is_op_type(*op, IP_REL)) {
         return true; /* RIP-relative is always safe */
     }
     if (op->indexreg != R_none) {
