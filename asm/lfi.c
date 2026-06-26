@@ -1711,6 +1711,31 @@ void lfi_emit_nops(int32_t segment, int count)
 #define LFI_MAX_SECTIONS 65536
 static bool lfi_is_code_seg[LFI_MAX_SECTIONS];
 
+static const char *next_token(const char *src, char *dest, size_t dest_len)
+{
+    size_t len = 0;
+    
+    /* Skip leading separators */
+    while (*src == ' ' || *src == '\t' || *src == ',') {
+        src++;
+    }
+    if (!*src) {
+        dest[0] = '\0';
+        return NULL;
+    }
+    
+    /* Copy token characters */
+    while (*src && *src != ' ' && *src != '\t' && *src != ',') {
+        if (len < dest_len - 1) {
+            dest[len++] = *src;
+        }
+        src++;
+    }
+    dest[len] = '\0';
+    
+    return src;
+}
+
 void lfi_register_section(int32_t seg, const char *value)
 {
     if (seg <= 0 || seg >= LFI_MAX_SECTIONS)
@@ -1722,25 +1747,28 @@ void lfi_register_section(int32_t seg, const char *value)
         return;
     }
 
-    /* Check if the section name or attributes indicate it contains executable code.
-     * We look for ".text" or the keywords "code" or "exec" (case-insensitive). */
-    bool is_code = false;
+    char token[256];
+    const char *p = value;
 
-    /* 1. Check if it starts with ".text" */
-    if (strncmp(value, ".text", 5) == 0) {
-        is_code = true;
-    } else {
-        /* 2. Case-insensitive search for "code" or "exec" */
-        for (const char *p = value; *p; p++) {
-            if (strncasecmp(p, "code", 4) == 0 || strncasecmp(p, "exec", 4) == 0) {
-                is_code = true;
-                break;
-            }
-        }
+    /* 1. First token is the Section Name */
+    p = next_token(p, token, sizeof(token));
+    if (!p) return;
+
+    /* Check if section name indicates code */
+    if (strcasecmp(token, ".text") == 0 ||
+        strcasecmp(token, ".gtext") == 0 ||
+        strncasecmp(token, ".text.", 6) == 0 ||   /* support sub-sections like .text.startup */
+        strncasecmp(token, ".gtext.", 7) == 0) {
+        lfi_is_code_seg[seg] = true;
+        return;
     }
 
-    if (is_code) {
-        lfi_is_code_seg[seg] = true;
+    /* 2. Scan remaining tokens for section attributes */
+    while ((p = next_token(p, token, sizeof(token))) != NULL) {
+        if (strcasecmp(token, "exec") == 0 || strcasecmp(token, "code") == 0) {
+            lfi_is_code_seg[seg] = true;
+            return;
+        }
     }
 }
 

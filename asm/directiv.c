@@ -331,7 +331,9 @@ bool process_directives(char *directive)
             switch_segment(seg);
             if (lfi_mode) {
                 lfi_register_section(seg, value);
-                ofmt->sectalign(location.segment, 32);
+                if (lfi_is_code_segment(seg)) {
+                    ofmt->sectalign(location.segment, 32);
+                }
             }
         }
         break;

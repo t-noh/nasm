@@ -39,10 +39,15 @@ def parse_check_lines(filepath):
                 
                 # Normalize spaces in pattern
                 pattern = re.sub(r'\s+', ' ', pattern)
-                # Remove register/offset formatting differences if any
-                # (e.g. replace commas with space-comma, etc.)
                 
                 assertions.append((assert_type, pattern))
+                continue
+                
+            # Parse CHECK-ALIGN assertions
+            align_match = re.match(r'^;\s*CHECK-ALIGN:\s*([^\s]+)\s+(\d+)', line)
+            if align_match:
+                assertions.append(('CHECK-ALIGN', (align_match.group(1), int(align_match.group(2)))))
+                continue
                 
     return run_line, assertions
 
@@ -166,6 +171,48 @@ def verify_assertions(instructions, assertions):
                 
     return True, "Passed"
 
+def verify_alignments(obj_path, align_assertions):
+    """
+    Runs readelf -W -S on obj_path and verifies that the sections have the expected alignment.
+    align_assertions is a list of (section_name, expected_align) tuples.
+    """
+    try:
+        result = subprocess.run(
+            ['readelf', '-W', '-S', obj_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        return False, f"Error running readelf: {e.stderr}"
+
+    actual_aligns = {}
+    lines = result.stdout.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line.startswith('['):
+            continue
+        line = line.replace('[', '').replace(']', '')
+        tokens = line.split()
+        if len(tokens) < 3:
+            continue
+        name = tokens[1]
+        try:
+            align = int(tokens[-1])
+            actual_aligns[name] = align
+        except ValueError:
+            continue
+
+    for name, expected in align_assertions:
+        if name not in actual_aligns:
+            return False, f"CHECK-ALIGN failed: Section '{name}' not found in object file."
+        actual = actual_aligns[name]
+        if actual != expected:
+            return False, f"CHECK-ALIGN failed for section '{name}': Expected alignment {expected}, but found {actual}."
+
+    return True, "Passed"
+
 def run_test(nasm_path, filepath):
     """
     Runs a single test case.
@@ -178,8 +225,6 @@ def run_test(nasm_path, filepath):
         flags = ['-lfi']
     else:
         # Extract LFI flags from the RUN line
-        # LLVM run line: llvm-mc -filetype asm -triple x86_64_lfi -mattr=+no-lfi-stores %s | FileCheck %s
-        # NASM run line: nasm -lfi <flags> %s
         flags = ['-lfi']
         if '-mattr=' in run_line:
             attr_match = re.search(r'-mattr=([^\s]*)', run_line)
@@ -210,28 +255,37 @@ def run_test(nasm_path, filepath):
         print(f"  Error:\n{e.stderr}")
         return False
         
-    # Disassemble
+    # Verify disassembly assertions
     instructions = get_disassembly(obj_path)
+    if instructions is None:
+        print(f"[{filename}] FAIL: Disassembly failed.")
+        if os.path.exists(obj_path):
+            os.remove(obj_path)
+        return False
+        
+    disasm_assertions = [a for a in assertions if a[0] in ('CHECK', 'CHECK-NEXT', 'CHECK-NOT')]
+    passed, message = verify_assertions(instructions, disasm_assertions)
+    
+    # Verify alignment assertions
+    if passed:
+        align_assertions = [a[1] for a in assertions if a[0] == 'CHECK-ALIGN']
+        if align_assertions:
+            passed, message = verify_alignments(obj_path, align_assertions)
+
     # Cleanup object file
     if os.path.exists(obj_path):
         os.remove(obj_path)
         
-    if instructions is None:
-        print(f"[{filename}] FAIL: Disassembly failed.")
-        return False
-        
-    # Verify assertions
-    passed, message = verify_assertions(instructions, assertions)
-    
     if passed:
         print(f"[{filename}] PASS")
         return True
     else:
         print(f"[{filename}] FAIL")
         print(f"  {message}")
-        print("  Disassembled instructions found:")
-        for idx, inst in enumerate(instructions):
-            print(f"    {idx:2d}: {inst}")
+        if disasm_assertions:
+            print("  Disassembled instructions found:")
+            for idx, inst in enumerate(instructions):
+                print(f"    {idx:2d}: {inst}")
         return False
 
 def main():
