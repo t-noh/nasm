@@ -1448,6 +1448,17 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
         nasm_fatal("LFI: LFI mode is only supported for the elf64 output format");
     }
 
+    /* Bypass data directives (db, dw, dd, dq, resb, resw, incbin, etc.)
+     * as they represent raw data, not executable code, and their operand arrays
+     * are uninitialized, which can trigger false positive memory sandboxing matches. */
+    if (opcode_is_db(ins->opcode) || opcode_is_resb(ins->opcode) || ins->opcode == I_INCBIN) {
+        *count = 1;
+        *bundle_lock_mask = 0b0000;
+        ret[0] = *ins;
+        ret[0].times = 1;
+        return;
+    }
+
     /* Relax all short jumps to near/auto jumps. Since LFI sandboxing expands instructions
      * (inserting bundle alignment, pre-loads, and address calculations), short jumps (1-byte offset)
      * can easily exceed their 127-byte range. Clearing the SHORT flag lets NASM's optimizer
