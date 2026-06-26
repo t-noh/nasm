@@ -1372,13 +1372,25 @@ static void expand_virtual_regs(insn *ins, int *count, insn *ret)
         get_virtual_reg_info(src_reg, &src_offset, &src_size);
         get_virtual_reg_info(dest_reg, &dest_offset, &dest_size);
 
-        enum reg_enum physical_scratch = get_physical_scratch(src_reg);
+        enum reg_enum phys_scratch_dest = get_physical_scratch(dest_reg);
+        const char *scratch_dest_name = regName(phys_scratch_dest);
 
-        parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, %s [%s + %d]",
-                       regName(physical_scratch), src_size, regName(LFI_CTXREG), src_offset);
+        bool dest_is_read = (ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX);
 
-        parse_line_fmt(&(ret[out_idx++]), bits, "%s %s [%s + %d], %s",
-                       nasm_insn_names[ins->opcode], dest_size, regName(LFI_CTXREG), dest_offset, regName(physical_scratch));
+        /* Step 1: If destination is read, load it into physical scratch R11 */
+        if (dest_is_read) {
+            parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, [%s + %d]",
+                           scratch_dest_name, regName(LFI_CTXREG), dest_offset);
+        }
+
+        /* Step 2: Execute the instruction using physical scratch as destination,
+         * and the virtual source memory slot directly as the source */
+        parse_line_fmt(&(ret[out_idx++]), bits, "%s %s, %s [%s + %d]",
+                       nasm_insn_names[ins->opcode], scratch_dest_name, src_size, regName(LFI_CTXREG), src_offset);
+
+        /* Step 3: Save physical scratch back to virtual destination slot */
+        parse_line_fmt(&(ret[out_idx++]), bits, "mov [%s + %d], %s",
+                       regName(LFI_CTXREG), dest_offset, scratch_dest_name);
     }
     /* Case B: Standard operation (exactly 1 virtualized register operand)
      * We use a secure 3-step intermediate redirection via physical scratch R11

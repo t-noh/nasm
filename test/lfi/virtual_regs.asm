@@ -64,3 +64,18 @@ _start:
     pop r15
     ; CHECK:      pop r11
     ; CHECK-NEXT: mov qword ptr [r15+0x38],r11
+
+    ; =========================================================================
+    ; 4. Case A: Virtual-to-Virtual Register Virtualization Tests
+    ; =========================================================================
+    ; 4.1. Standard ALU (reads/writes destination): add r14, r11
+    add r14, r11
+    ; CHECK:      mov r11,qword ptr [r15+0x30]
+    ; CHECK-NEXT: add r11,qword ptr [r15+0x28]
+    ; CHECK-NEXT: mov qword ptr [r15+0x30],r11
+
+    ; 4.2. Mismatched size GPR-only (write-only on destination): movzx r14d, r11w
+    movzx r14d, r11w
+    ; CHECK:      movzx r11d,word ptr [r15+0x28]
+    ; CHECK-NEXT: mov dword ptr [r15+0x30],r11d
+
