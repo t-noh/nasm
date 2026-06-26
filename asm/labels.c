@@ -586,7 +586,7 @@ void backend_label(const char *label, int32_t segment, int64_t offset)
 
 bool is_local_label(const char* label)
 {
-    return islocal(label);
+    return label[0] == '.';
 }
 
 int init_labels(void)
