@@ -4145,7 +4145,7 @@ static void process_times_insn(insn *ins)
  */
 void process_insn(insn *ins)
 {
-    if (lfi_mode) {
+    if (lfi_mode && lfi_is_code_segment(location.segment)) {
         lfi_process_insn(ins);
     } else {
         if (likely(ins->times == 1)) {

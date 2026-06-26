@@ -1562,13 +1562,6 @@ static int get_bundle_padsize(int64_t offset, int minSpaceInCurrBlock, int64_t r
 
 void lfi_process_insn(insn *ins)
 {
-    if (!lfi_is_code_segment(location.segment)) {
-        process_one_insn(ins);
-        return;
-    }
-
-
-
     int rewriteCount = 0;
     insn rewrittenInsns[16];
     memset(rewrittenInsns, 0, sizeof(rewrittenInsns));
