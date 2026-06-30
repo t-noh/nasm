@@ -1222,6 +1222,133 @@ static bool needs_reg_virtualization(insn *ins)
 }
 
 
+/* Map a 64-bit base register to match the size of a reference register */
+static enum reg_enum get_sized_reg(enum reg_enum base_reg, enum reg_enum size_ref_reg)
+{
+    int size = 8;
+    switch (size_ref_reg) {
+        case R_EAX: case R_EBX: case R_ECX: case R_EDX:
+        case R_ESI: case R_EDI: case R_EBP: case R_ESP:
+        case R_R8D: case R_R9D: case R_R10D: case R_R11D:
+        case R_R12D: case R_R13D: case R_R14D: case R_R15D:
+            size = 4;
+            break;
+        case R_AX: case R_BX: case R_CX: case R_DX:
+        case R_SI: case R_DI: case R_BP: case R_SP:
+        case R_R8W: case R_R9W: case R_R10W: case R_R11W:
+        case R_R12W: case R_R13W: case R_R14W: case R_R15W:
+            size = 2;
+            break;
+        case R_AL: case R_BL: case R_CL: case R_DL:
+        case R_SIL: case R_DIL: case R_BPL: case R_SPL:
+        case R_R8B: case R_R9B: case R_R10B: case R_R11B:
+        case R_R12B: case R_R13B: case R_R14B: case R_R15B:
+        case R_AH: case R_BH: case R_CH: case R_DH:
+            size = 1;
+            break;
+        default:
+            break;
+    }
+
+    switch (base_reg) {
+        case R_RAX:
+            if (size == 4) return R_EAX;
+            if (size == 2) return R_AX;
+            if (size == 1) return R_AL;
+            return R_RAX;
+        case R_RBX:
+            if (size == 4) return R_EBX;
+            if (size == 2) return R_BX;
+            if (size == 1) return R_BL;
+            return R_RBX;
+        case R_RCX:
+            if (size == 4) return R_ECX;
+            if (size == 2) return R_CX;
+            if (size == 1) return R_CL;
+            return R_RCX;
+        case R_RDX:
+            if (size == 4) return R_EDX;
+            if (size == 2) return R_DX;
+            if (size == 1) return R_DL;
+            return R_RDX;
+        case R_RSI:
+            if (size == 4) return R_ESI;
+            if (size == 2) return R_SI;
+            if (size == 1) return R_SIL;
+            return R_RSI;
+        case R_RDI:
+            if (size == 4) return R_EDI;
+            if (size == 2) return R_DI;
+            if (size == 1) return R_DIL;
+            return R_RDI;
+        case R_RBP:
+            if (size == 4) return R_EBP;
+            if (size == 2) return R_BP;
+            if (size == 1) return R_BPL;
+            return R_RBP;
+        case R_R8:
+            if (size == 4) return R_R8D;
+            if (size == 2) return R_R8W;
+            if (size == 1) return R_R8B;
+            return R_R8;
+        case R_R9:
+            if (size == 4) return R_R9D;
+            if (size == 2) return R_R9W;
+            if (size == 1) return R_R9B;
+            return R_R9;
+        case R_R10:
+            if (size == 4) return R_R10D;
+            if (size == 2) return R_R10W;
+            if (size == 1) return R_R10B;
+            return R_R10;
+        case R_R12:
+            if (size == 4) return R_R12D;
+            if (size == 2) return R_R12W;
+            if (size == 1) return R_R12B;
+            return R_R12;
+        case R_R13:
+            if (size == 4) return R_R13D;
+            if (size == 2) return R_R13W;
+            if (size == 1) return R_R13B;
+            return R_R13;
+        default:
+            return base_reg;
+    }
+}
+
+/* Find a safe GPR that is NOT used in the current instruction */
+static enum reg_enum find_unused_gpr(insn *ins)
+{
+    bool used[REG_ENUM_LIMIT] = {false};
+
+    for (int i = 0; i < ins->operands; i++) {
+        operand *op = &ins->oprs[i];
+        if (is_op_type(*op, REGISTER)) {
+            used[get_64bit_parent(op->basereg)] = true;
+        }
+        if (is_op_type(*op, MEMORY)) {
+            if (op->basereg != R_none) {
+                used[get_64bit_parent(op->basereg)] = true;
+            }
+            if (op->indexreg != R_none) {
+                used[get_64bit_parent(op->indexreg)] = true;
+            }
+        }
+    }
+
+    static const enum reg_enum safe_gprs[] = {
+        R_RAX, R_RBX, R_RCX, R_RDX, R_RSI, R_RDI, R_RBP, R_R8, R_R9, R_R10, R_R12, R_R13
+    };
+
+    for (size_t i = 0; i < sizeof(safe_gprs)/sizeof(safe_gprs[0]); i++) {
+        if (!used[safe_gprs[i]]) {
+            return safe_gprs[i];
+        }
+    }
+
+    return R_none;
+}
+
 /* Prepare register virtualization by generating loads/stores and rewriting to physical registers */
 static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn *post_store, int *post_count)
 {
@@ -1232,8 +1359,28 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
     bool preloaded_scratch = false;
     int scratch_offset = 0;
 
-    /* 1. Pre-load virtual r11/r14/r15 into physical scratch r11 for memory operands,
-     * and rewrite the memory operands to use physical r11. */
+    bool use_spill = false;
+    enum reg_enum spill_reg = R_none;
+    insn orig_ins = *ins;
+
+restart:
+    *ins = orig_ins;
+    pre_idx = 0;
+    post_idx = 0;
+    preloaded_scratch = false;
+
+    if (use_spill && spill_reg == R_none) {
+        spill_reg = find_unused_gpr(ins);
+        if (spill_reg == R_none) {
+            lfi_report_error(true, "LFI: failed to find unused GPR for stack spilling");
+            return;
+        }
+        /* Emit push spill_reg */
+        parse_line_fmt(&(pre_load[pre_idx++]), bits, "push %s", regName(spill_reg));
+    }
+
+    /* 1. Pre-load virtual r11/r14/r15 into physical scratch r11 (and spill_reg if needed) for memory operands,
+     * and rewrite the memory operands to use physical registers. */
     for (int i = 0; i < ins->operands; i++) {
         operand *op = &ins->oprs[i];
         if (is_op_type(*op, MEMORY)) {
@@ -1246,17 +1393,25 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
                         /* Generate pre-load: mov r11, [r15 + scratch_offset] */
                         parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
                         preloaded_scratch = true;
+                        op->basereg = R_R11;
                     } else {
                         int current_offset;
                         const char *dummy_size;
                         get_virtual_reg_info(op->basereg, &current_offset, &dummy_size);
                         if (current_offset != scratch_offset) {
-                            lfi_report_error(true, "LFI: register virtualization collision in memory operand (base_offset=%d, index_offset=%d)",
-                                             scratch_offset, current_offset);
+                            if (use_spill) {
+                                enum reg_enum sized_spill = get_sized_reg(spill_reg, op->basereg);
+                                parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]",
+                                               regName(sized_spill), regName(LFI_CTXREG), current_offset);
+                                op->basereg = sized_spill;
+                            } else {
+                                use_spill = true;
+                                goto restart;
+                            }
+                        } else {
+                            op->basereg = R_R11;
                         }
                     }
-                    /* Rewrite AST: replace base register with physical R_R11 */
-                    op->basereg = R_R11;
                 }
             }
             if (op->indexreg != R_none) {
@@ -1267,17 +1422,25 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
                         get_virtual_reg_info(op->indexreg, &scratch_offset, &dummy_size);
                         parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
                         preloaded_scratch = true;
+                        op->indexreg = R_R11;
                     } else {
                         int current_offset;
                         const char *dummy_size;
                         get_virtual_reg_info(op->indexreg, &current_offset, &dummy_size);
                         if (current_offset != scratch_offset) {
-                            lfi_report_error(true, "LFI: register virtualization collision in memory operand (base_offset=%d, index_offset=%d)",
-                                             scratch_offset, current_offset);
+                            if (use_spill) {
+                                enum reg_enum sized_spill = get_sized_reg(spill_reg, op->indexreg);
+                                parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]",
+                                               regName(sized_spill), regName(LFI_CTXREG), current_offset);
+                                op->indexreg = sized_spill;
+                            } else {
+                                use_spill = true;
+                                goto restart;
+                            }
+                        } else {
+                            op->indexreg = R_R11;
                         }
                     }
-                    /* Rewrite AST: replace index register with physical R_R11 */
-                    op->indexreg = R_R11;
                 }
             }
         }
@@ -1308,34 +1471,38 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
         get_virtual_reg_info(dest_reg, &dest_offset, &dest_size);
 
         enum reg_enum phys_scratch_dest = get_physical_scratch(dest_reg);
-        const char *scratch_dest_name = regName(phys_scratch_dest);
-
         bool dest_is_read = (ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_LEA);
 
         if (preloaded_scratch) {
-            lfi_report_error(true, "LFI: register virtualization collision (memory + register) in Case A");
+            if (!use_spill) {
+                use_spill = true;
+                goto restart;
+            }
         }
 
-        /* Step 1: If destination is read, load it into physical scratch R11 */
+        enum reg_enum dest_scratch = use_spill ? get_sized_reg(spill_reg, dest_reg) : phys_scratch_dest;
+        const char *dest_scratch_name = regName(dest_scratch);
+
+        /* Step 1: If destination is read, load it into scratch */
         if (dest_is_read) {
             parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]",
-                           scratch_dest_name, regName(LFI_CTXREG), dest_offset);
+                           dest_scratch_name, regName(LFI_CTXREG), dest_offset);
         }
 
         /* Step 2: Rewrite the instruction in-place:
-         * dest becomes physical scratch (r11).
+         * dest becomes scratch.
          * src becomes memory slot [r15 + src_offset].
          */
-        ins->oprs[dest_idx].basereg = phys_scratch_dest;
+        ins->oprs[dest_idx].basereg = dest_scratch;
 
         ins->oprs[src_idx].type = MEMORY | (ins->oprs[src_idx].type & ~REGISTER);
         ins->oprs[src_idx].basereg = LFI_CTXREG;
         ins->oprs[src_idx].indexreg = R_none;
         ins->oprs[src_idx].offset = src_offset;
 
-        /* Step 3: Save physical scratch back to virtual destination slot */
+        /* Step 3: Save scratch back to virtual destination slot */
         parse_line_fmt(&(post_store[post_idx++]), bits, "mov [%s + %d], %s",
-                       regName(LFI_CTXREG), dest_offset, scratch_dest_name);
+                       regName(LFI_CTXREG), dest_offset, dest_scratch_name);
     }
     /* Case B: Standard operation (exactly 1 virtualized register operand) */
     else if (virtualized_ops_count == 1) {
@@ -1348,8 +1515,6 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
         get_virtual_reg_info(v_reg, &v_offset, &v_size_prefix);
 
         enum reg_enum phys_scratch = get_physical_scratch(v_reg);
-        const char *scratch_name = regName(phys_scratch);
-
         bool is_write = (v_idx == 0 && ins->opcode != I_PUSH && ins->opcode != I_CMP && ins->opcode != I_TEST);
         bool is_read = (v_idx == 1) || (ins->opcode == I_PUSH) || (v_idx == 0 && ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_PMOVMSKB && ins->opcode != I_POP && ins->opcode != I_LEA);
 
@@ -1357,23 +1522,34 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
             if (scratch_offset == v_offset) {
                 is_read = false; /* Already loaded */
             } else if (is_read) {
-                lfi_report_error(true, "LFI: register virtualization collision (memory + register) (mem_offset=%d, reg_offset=%d)",
-                                 scratch_offset, v_offset);
+                if (!use_spill) {
+                    use_spill = true;
+                    goto restart;
+                }
             }
         }
 
-        /* Step 1: If read, load virtual register into physical scratch R11 */
+        enum reg_enum scratch = (use_spill && preloaded_scratch && scratch_offset != v_offset) ?
+                                get_sized_reg(spill_reg, v_reg) : phys_scratch;
+        const char *scratch_name = regName(scratch);
+
+        /* Step 1: If read, load virtual register into scratch */
         if (is_read) {
             parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]", scratch_name, regName(LFI_CTXREG), v_offset);
         }
 
-        /* Step 2: Rewrite the instruction operand in-place to use physical scratch R11 */
-        v_op->basereg = phys_scratch;
+        /* Step 2: Rewrite the instruction operand in-place to use scratch */
+        v_op->basereg = scratch;
 
-        /* Step 3: If written, save physical scratch R11 back to virtual register slot */
+        /* Step 3: If written, save scratch back to virtual register slot */
         if (is_write) {
             parse_line_fmt(&(post_store[post_idx++]), bits, "mov [%s + %d], %s", regName(LFI_CTXREG), v_offset, scratch_name);
         }
+    }
+
+    if (use_spill) {
+        /* Emit pop spill_reg */
+        parse_line_fmt(&(post_store[post_idx++]), bits, "pop %s", regName(spill_reg));
     }
 
     *pre_count = pre_idx;
