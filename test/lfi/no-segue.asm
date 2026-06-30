@@ -30,14 +30,14 @@ mov rdi, [rsp]
 ; Absolute register (R14) - no sandboxing needed
 mov rdi, [r14]
 ; CHECK:      mov r11,qword ptr [r15+0x30]
-; CHECK-NEXT: mov r11d,r11d
-; CHECK-NEXT: mov rdi,qword ptr [r14+r11*1]
+; CHECK-NEXT: mov edi,r11d
+; CHECK-NEXT: mov rdi,qword ptr [r14+rdi*1]
 
 ; Index with absolute base - just clear index high bits
 mov rdi, [r14 + rax]
 ; CHECK:      mov r11,qword ptr [r15+0x30]
-; CHECK-NEXT: lea r11d,[r11+rax*1]
-; CHECK-NEXT: mov rdi,qword ptr [r14+r11*1]
+; CHECK-NEXT: lea edi,[r11+rax*1]
+; CHECK-NEXT: mov rdi,qword ptr [r14+rdi*1]
 
 ; Complex addressing with offset - LEA used
 mov rdi, [rax + rcx*4 + 16]

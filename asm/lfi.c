@@ -141,9 +141,6 @@ static bool is_ea_flags(operand op, int flags)
     return (op.eaflags & flags) == flags;
 }
 
-/* File-scope tracker to determine if R15 is used as a general-purpose register in the current file */
-static bool lfi_r15_used_as_gpr = false;
-
 /* Check if a memory operand is inherently safe (does not require sandboxing) */
 static bool is_safe_memop(operand *op)
 {
@@ -157,9 +154,8 @@ static bool is_safe_memop(operand *op)
     if (base == R_RSP || base == R_RBP) {
         return true; /* Stack and frame pointer accesses are always safe */
     }
-    /* Context register access is only safe as a physical TLS access (offset 32)
-     * and only if R15 is not being used as a general-purpose register in this file. */
-    if (base == LFI_CTXREG && !lfi_r15_used_as_gpr && op->offset == 32) {
+    /* Context register access is always safe (user R15 accesses are virtualized before this) */
+    if (base == LFI_CTXREG) {
         return true;
     }
     return false;
@@ -1195,30 +1191,6 @@ static enum reg_enum get_physical_scratch(enum reg_enum size_ref_reg)
 /* Check if an instruction needs register virtualization */
 static bool needs_reg_virtualization(insn *ins)
 {
-    /* First, scan for explicit GPR uses of r15 to activate file-scope GPR mode.
-     * Since NASM is invoked once per file, this static tracker naturally resets per file. */
-    if (!lfi_r15_used_as_gpr) {
-        for (int i = 0; i < ins->operands; i++) {
-            operand *op = &ins->oprs[i];
-            if (is_op_type(*op, REGISTER)) {
-                if (get_64bit_parent(op->basereg) == LFI_CTXREG) {
-                    lfi_r15_used_as_gpr = true;
-                    break;
-                }
-            }
-            if (is_op_type(*op, MEMORY)) {
-                if (op->basereg != R_none && get_64bit_parent(op->basereg) == LFI_CTXREG && op->offset != 32) {
-                    lfi_r15_used_as_gpr = true;
-                    break;
-                }
-                if (op->indexreg != R_none && get_64bit_parent(op->indexreg) == LFI_CTXREG) {
-                    lfi_r15_used_as_gpr = true;
-                    break;
-                }
-            }
-        }
-    }
-
     for (int i = 0; i < ins->operands; i++) {
         operand *op = &ins->oprs[i];
 
@@ -1230,19 +1202,12 @@ static bool needs_reg_virtualization(insn *ins)
             }
         }
 
-        /* 2. Check Memory Operands: r11, r14, and r15 need virtualization in memory operands.
-         * If r15 is used as a GPR in the file, we virtualize ALL its memory accesses (including offset 32).
-         * Otherwise, we only virtualize if offset != 32. */
+        /* 2. Check Memory Operands: r11, r14, and r15 need virtualization in memory operands. */
         if (is_op_type(*op, MEMORY)) {
             if (op->basereg != R_none) {
                 enum reg_enum parent = get_64bit_parent(op->basereg);
-                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE) {
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
                     return true;
-                }
-                if (parent == LFI_CTXREG) {
-                    if (lfi_r15_used_as_gpr || op->offset != 32) {
-                        return true;
-                    }
                 }
             }
             if (op->indexreg != R_none) {
@@ -1256,59 +1221,13 @@ static bool needs_reg_virtualization(insn *ins)
     return false;
 }
 
-/* Helper to format an operand, sandboxing memory operands inline to prevent LFI bypasses */
-static void format_operand_sandboxed(insn *ins, int op_idx, char *dest)
-{
-    operand *op = &ins->oprs[op_idx];
-    if (is_op_type(*op, MEMORY)) {
-        /* If it is a safe memory operand (stack or RIP-relative), do not sandbox it! */
-        if (is_safe_memop(op)) {
-            get_normal_memstr(op, dest);
-        } else {
-            /* Segue Mode: Use GS segment override */
-            if (!lfi_no_segue) {
-                get_segue_memstr(op, dest);
-            }
-            /* No-Segue Mode: Format relative to SBX_BASE (r14) + SCRATCH (r11) */
-            else {
-                get_explicit_memstr(op, LFI_SBX_BASE, LFI_SCRATCH_REG, 1, 0, dest);
-            }
-        }
-    } else {
-        get_operand_string_rep(op, dest);
-    }
-}
 
-/* Helper to find the index of the first unsafe memory operand in an instruction */
-static int get_unsafe_mem_op_index(insn *ins)
-{
-    for (int i = 0; i < ins->operands; i++) {
-        if (is_op_type(ins->oprs[i], MEMORY) && !is_safe_memop(&ins->oprs[i])) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-/* Helper to emit No-Segue address calculation if needed */
-static void maybe_emit_nosegue_addr(insn *ins, int *out_idx, insn *ret)
-{
-    if (lfi_no_segue) {
-        int mem_idx = get_unsafe_mem_op_index(ins);
-        if (mem_idx != -1) {
-            char addressCalcStr[1024];
-            const char *scratch32 = get_32bit_reg_name(LFI_SCRATCH_REG);
-            get_nosegue_addr(&ins->oprs[mem_idx], scratch32, addressCalcStr);
-            parse_line(addressCalcStr, &(ret[(*out_idx)++]), ins->bits);
-        }
-    }
-}
-
-/* Perform register virtualization expansion */
-static void expand_virtual_regs(insn *ins, int *count, insn *ret)
+/* Prepare register virtualization by generating loads/stores and rewriting to physical registers */
+static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn *post_store, int *post_count)
 {
     int bits = ins->bits;
-    int out_idx = 0;
+    int pre_idx = 0;
+    int post_idx = 0;
 
     bool preloaded_scratch = false;
     int scratch_offset = 0;
@@ -1320,27 +1239,43 @@ static void expand_virtual_regs(insn *ins, int *count, insn *ret)
         if (is_op_type(*op, MEMORY)) {
             if (op->basereg != R_none) {
                 enum reg_enum parent = get_64bit_parent(op->basereg);
-                if ((parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || (parent == LFI_CTXREG && (op->offset != 32 || lfi_r15_used_as_gpr))) && !preloaded_scratch) {
-                    const char *dummy_size;
-                    get_virtual_reg_info(op->basereg, &scratch_offset, &dummy_size);
-                    /* Generate pre-load: mov r11, [r15 + scratch_offset] */
-                    parse_line_fmt(&(ret[out_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
-                    preloaded_scratch = true;
-                }
-                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || (parent == LFI_CTXREG && (op->offset != 32 || lfi_r15_used_as_gpr))) {
+                if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                    if (!preloaded_scratch) {
+                        const char *dummy_size;
+                        get_virtual_reg_info(op->basereg, &scratch_offset, &dummy_size);
+                        /* Generate pre-load: mov r11, [r15 + scratch_offset] */
+                        parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
+                        preloaded_scratch = true;
+                    } else {
+                        int current_offset;
+                        const char *dummy_size;
+                        get_virtual_reg_info(op->basereg, &current_offset, &dummy_size);
+                        if (current_offset != scratch_offset) {
+                            lfi_report_error(true, "LFI: register virtualization collision in memory operand (base_offset=%d, index_offset=%d)",
+                                             scratch_offset, current_offset);
+                        }
+                    }
                     /* Rewrite AST: replace base register with physical R_R11 */
                     op->basereg = R_R11;
                 }
             }
             if (op->indexreg != R_none) {
                 enum reg_enum parent = get_64bit_parent(op->indexreg);
-                if ((parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) && !preloaded_scratch) {
-                    const char *dummy_size;
-                    get_virtual_reg_info(op->indexreg, &scratch_offset, &dummy_size);
-                    parse_line_fmt(&(ret[out_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
-                    preloaded_scratch = true;
-                }
                 if (parent == LFI_SCRATCH_REG || parent == LFI_SBX_BASE || parent == LFI_CTXREG) {
+                    if (!preloaded_scratch) {
+                        const char *dummy_size;
+                        get_virtual_reg_info(op->indexreg, &scratch_offset, &dummy_size);
+                        parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov r11, [%s + %d]", regName(LFI_CTXREG), scratch_offset);
+                        preloaded_scratch = true;
+                    } else {
+                        int current_offset;
+                        const char *dummy_size;
+                        get_virtual_reg_info(op->indexreg, &current_offset, &dummy_size);
+                        if (current_offset != scratch_offset) {
+                            lfi_report_error(true, "LFI: register virtualization collision in memory operand (base_offset=%d, index_offset=%d)",
+                                             scratch_offset, current_offset);
+                        }
+                    }
                     /* Rewrite AST: replace index register with physical R_R11 */
                     op->indexreg = R_R11;
                 }
@@ -1375,26 +1310,34 @@ static void expand_virtual_regs(insn *ins, int *count, insn *ret)
         enum reg_enum phys_scratch_dest = get_physical_scratch(dest_reg);
         const char *scratch_dest_name = regName(phys_scratch_dest);
 
-        bool dest_is_read = (ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX);
+        bool dest_is_read = (ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_LEA);
+
+        if (preloaded_scratch) {
+            lfi_report_error(true, "LFI: register virtualization collision (memory + register) in Case A");
+        }
 
         /* Step 1: If destination is read, load it into physical scratch R11 */
         if (dest_is_read) {
-            parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, [%s + %d]",
+            parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]",
                            scratch_dest_name, regName(LFI_CTXREG), dest_offset);
         }
 
-        /* Step 2: Execute the instruction using physical scratch as destination,
-         * and the virtual source memory slot directly as the source */
-        parse_line_fmt(&(ret[out_idx++]), bits, "%s %s, %s [%s + %d]",
-                       nasm_insn_names[ins->opcode], scratch_dest_name, src_size, regName(LFI_CTXREG), src_offset);
+        /* Step 2: Rewrite the instruction in-place:
+         * dest becomes physical scratch (r11).
+         * src becomes memory slot [r15 + src_offset].
+         */
+        ins->oprs[dest_idx].basereg = phys_scratch_dest;
+
+        ins->oprs[src_idx].type = MEMORY | (ins->oprs[src_idx].type & ~REGISTER);
+        ins->oprs[src_idx].basereg = LFI_CTXREG;
+        ins->oprs[src_idx].indexreg = R_none;
+        ins->oprs[src_idx].offset = src_offset;
 
         /* Step 3: Save physical scratch back to virtual destination slot */
-        parse_line_fmt(&(ret[out_idx++]), bits, "mov [%s + %d], %s",
+        parse_line_fmt(&(post_store[post_idx++]), bits, "mov [%s + %d], %s",
                        regName(LFI_CTXREG), dest_offset, scratch_dest_name);
     }
-    /* Case B: Standard operation (exactly 1 virtualized register operand)
-     * We use a secure 3-step intermediate redirection via physical scratch R11
-     * to completely bypass all x86 hardware constraints (like pmovmskb [mem] or mov [mem], [mem]). */
+    /* Case B: Standard operation (exactly 1 virtualized register operand) */
     else if (virtualized_ops_count == 1) {
         int v_idx = virtualized_op_indices[0];
         operand *v_op = &ins->oprs[v_idx];
@@ -1407,47 +1350,66 @@ static void expand_virtual_regs(insn *ins, int *count, insn *ret)
         enum reg_enum phys_scratch = get_physical_scratch(v_reg);
         const char *scratch_name = regName(phys_scratch);
 
-        /* Determine if the virtual register is read and/or written */
         bool is_write = (v_idx == 0 && ins->opcode != I_PUSH && ins->opcode != I_CMP && ins->opcode != I_TEST);
-        bool is_read = (v_idx == 1) || (ins->opcode == I_PUSH) || (v_idx == 0 && ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_PMOVMSKB && ins->opcode != I_POP);
+        bool is_read = (v_idx == 1) || (ins->opcode == I_PUSH) || (v_idx == 0 && ins->opcode != I_MOV && ins->opcode != I_MOVZX && ins->opcode != I_MOVSX && ins->opcode != I_PMOVMSKB && ins->opcode != I_POP && ins->opcode != I_LEA);
+
+        if (preloaded_scratch && get_64bit_parent(phys_scratch) == LFI_SCRATCH_REG) {
+            if (scratch_offset == v_offset) {
+                is_read = false; /* Already loaded */
+            } else if (is_read) {
+                lfi_report_error(true, "LFI: register virtualization collision (memory + register) (mem_offset=%d, reg_offset=%d)",
+                                 scratch_offset, v_offset);
+            }
+        }
 
         /* Step 1: If read, load virtual register into physical scratch R11 */
         if (is_read) {
-            parse_line_fmt(&(ret[out_idx++]), bits, "mov %s, [%s + %d]", scratch_name, regName(LFI_CTXREG), v_offset);
+            parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov %s, [%s + %d]", scratch_name, regName(LFI_CTXREG), v_offset);
         }
 
-        /* Step 2: Rewrite the instruction operand to use physical scratch R11, and parse it.
-         * We also perform inline sandboxing of any memory operands to prevent LFI bypasses! */
-        maybe_emit_nosegue_addr(ins, &out_idx, ret);
-
-        char opsStr[3][256];
-        for (int i = 0; i < ins->operands; i++) {
-            if (i == v_idx) {
-                strcpy(opsStr[i], scratch_name);
-            } else {
-                format_operand_sandboxed(ins, i, opsStr[i]);
-            }
-        }
-        parse_insn_ops(ins, &(ret[out_idx++]), opsStr[0], opsStr[1], opsStr[2]);
+        /* Step 2: Rewrite the instruction operand in-place to use physical scratch R11 */
+        v_op->basereg = phys_scratch;
 
         /* Step 3: If written, save physical scratch R11 back to virtual register slot */
         if (is_write) {
-            parse_line_fmt(&(ret[out_idx++]), bits, "mov [%s + %d], %s", regName(LFI_CTXREG), v_offset, scratch_name);
+            parse_line_fmt(&(post_store[post_idx++]), bits, "mov [%s + %d], %s", regName(LFI_CTXREG), v_offset, scratch_name);
         }
     }
-    /* Case C: Only memory operands were virtualized (0 virtualized register operands)
-     * We just format and parse the instruction normally (which now correctly uses physical R11). */
-    else {
-        maybe_emit_nosegue_addr(ins, &out_idx, ret);
 
-        char opsStr[3][256];
-        for (int i = 0; i < ins->operands; i++) {
-            format_operand_sandboxed(ins, i, opsStr[i]);
+    *pre_count = pre_idx;
+    *post_count = post_idx;
+}
+
+/*
+ * Helper to dispatch an instruction to its corresponding LFI expansion module.
+ */
+static void dispatch_expand(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask)
+{
+    if (is_syscall(ins)) {
+        expand_syscall(ins, count, ret, bundle_lock_mask);
+    } else if (is_tls_access(ins)) {
+        int mem_index = get_mem_op_index(ins);
+        if (is_memload(ins, mem_index)) {
+            expand_tlsread(ins, count, ret, bundle_lock_mask);
+        } else {
+            expand_tlswrite(ins, count, ret, bundle_lock_mask);
         }
-        parse_insn_ops(ins, &(ret[out_idx++]), opsStr[0], opsStr[1], opsStr[2]);
+    } else if (is_direct_call(ins)) {
+        expand_direct_call(ins, count, ret, bundle_lock_mask);
+    } else if (is_indirect_branch(ins)) {
+        expand_indirect_branch(ins, count, ret, bundle_lock_mask);
+    } else if (is_return(ins)) {
+        expand_return(ins, count, ret, bundle_lock_mask);
+    } else if (is_string_op(ins)) {
+        expand_string_op(ins, count, ret, bundle_lock_mask);
+    } else if (is_stack_mod(ins)) {
+        expand_stack_mod(ins, count, ret, bundle_lock_mask);
+    } else {
+        if (uses_gs_invalidly(ins)) {
+            lfi_report_error(true, "LFI: invalid use of %%gs segment register");
+        }
+        expand_load_store(ins, count, ret, bundle_lock_mask);
     }
-
-    *count = out_idx;
 }
 
 /*
@@ -1479,58 +1441,67 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
         ins->oprs[i].type &= ~SHORT;
     }
 
-    /* STEP 0: Virtualize reserved registers (r11, r14, r15) if they are used by the user's code.
-     * This transparently redirects them to thread-local context memory offsets. */
-    if (needs_reg_virtualization(ins)) {
-        expand_virtual_regs(ins, count, ret);
-        /* Bundle-lock the entire expanded sequence to prevent instructions from being split across
-         * bundle boundaries or targeted individually. Formula: (1 << count) - 2 sets bits 1..count-1. */
-        *bundle_lock_mask = (1 << *count) - 2;
+    /* =========================================================================
+     * PATH 1: Normal Path (No Register Virtualization)
+     * ========================================================================= */
+    if (!needs_reg_virtualization(ins)) {
+        /* 1. Safety Checks */
+        if (modifies_reserved_reg(ins, LFI_SBX_BASE)) {
+            lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r14");
+        }
+        if (modifies_reserved_reg(ins, LFI_SCRATCH_REG)) {
+            lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r11");
+        }
+        if (uses_r15_invalidly(ins)) {
+            lfi_report_error(true, "LFI: illegal use of reserved LFI context register %%r15");
+        }
+
+        /* 2. Direct Dispatch */
+        dispatch_expand(ins, count, ret, bundle_lock_mask);
         return;
     }
 
-    /* 1. Check for illegal modification of R14 (sandbox base) */
-    if (modifies_reserved_reg(ins, LFI_SBX_BASE)) {
-        lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r14");
+    /* =========================================================================
+     * PATH 2: Register Virtualization Path
+     * ========================================================================= */
+    insn pre_load[8];
+    int pre_count = 0;
+    insn post_store[8];
+    int post_count = 0;
+    insn working_ins = *ins;
+
+    /* 1. Generate pre-load/post-store and rewrite working_ins */
+    prepare_virtual_regs(&working_ins, pre_load, &pre_count, post_store, &post_count);
+
+    /* 2. Dispatch the rewritten instruction to a temporary middle array */
+    insn middle_insns[16];
+    int middle_count = 0;
+    bundle_lock_mask_t dummy_mask = 0; // Ignored because we lock the whole sequence
+
+    dispatch_expand(&working_ins, &middle_count, middle_insns, &dummy_mask);
+
+    /* 4. Combine pre_load + middle_insns + post_store into ret */
+    int out_idx = 0;
+    for (int i = 0; i < pre_count; i++) {
+        ret[out_idx] = pre_load[i];
+        ret[out_idx].times = 1;
+        out_idx++;
+    }
+    for (int i = 0; i < middle_count; i++) {
+        ret[out_idx] = middle_insns[i];
+        ret[out_idx].times = 1;
+        out_idx++;
+    }
+    for (int i = 0; i < post_count; i++) {
+        ret[out_idx] = post_store[i];
+        ret[out_idx].times = 1;
+        out_idx++;
     }
 
-    /* 2. Check for illegal modification of R11 (scratch register) */
-    if (modifies_reserved_reg(ins, LFI_SCRATCH_REG)) {
-        lfi_report_error(true, "LFI: illegal modification of reserved LFI register %%r11");
-    }
+    *count = out_idx;
 
-    /* 3. Check for illegal uses of R15 (context register) */
-    if (uses_r15_invalidly(ins)) {
-        lfi_report_error(true, "LFI: illegal use of reserved LFI context register %%r15");
-    }
-
-    /* Dispatch based on instruction type, matching LLVM X86MCLFIRewriter.cpp */
-    if (is_syscall(ins)) {
-        expand_syscall(ins, count, ret, bundle_lock_mask);
-    } else if (is_tls_access(ins)) {
-        int mem_index = get_mem_op_index(ins);
-        if (is_memload(ins, mem_index)) {
-            expand_tlsread(ins, count, ret, bundle_lock_mask);
-        } else {
-            expand_tlswrite(ins, count, ret, bundle_lock_mask);
-        }
-    } else if (is_direct_call(ins)) {
-        expand_direct_call(ins, count, ret, bundle_lock_mask);
-    } else if (is_indirect_branch(ins)) {
-        expand_indirect_branch(ins, count, ret, bundle_lock_mask);
-    } else if (is_return(ins)) {
-        expand_return(ins, count, ret, bundle_lock_mask);
-    } else if (is_string_op(ins)) {
-        expand_string_op(ins, count, ret, bundle_lock_mask);
-    } else if (is_stack_mod(ins)) {
-        expand_stack_mod(ins, count, ret, bundle_lock_mask);
-    } else {
-        /* Check for invalid use of GS segment in general instructions */
-        if (uses_gs_invalidly(ins)) {
-            lfi_report_error(true, "LFI: invalid use of %%gs segment register");
-        }
-        expand_load_store(ins, count, ret, bundle_lock_mask);
-    }
+    /* 5. Bundle-lock the entire expanded sequence */
+    *bundle_lock_mask = (1 << out_idx) - 2;
 }
 
 /* =========================================================================
@@ -1714,7 +1685,7 @@ static bool lfi_is_code_seg[LFI_MAX_SECTIONS];
 static const char *next_token(const char *src, char *dest, size_t dest_len)
 {
     size_t len = 0;
-    
+
     /* Skip leading separators */
     while (*src == ' ' || *src == '\t' || *src == ',') {
         src++;
@@ -1723,7 +1694,7 @@ static const char *next_token(const char *src, char *dest, size_t dest_len)
         dest[0] = '\0';
         return NULL;
     }
-    
+
     /* Copy token characters */
     while (*src && *src != ' ' && *src != '\t' && *src != ',') {
         if (len < dest_len - 1) {
@@ -1732,7 +1703,7 @@ static const char *next_token(const char *src, char *dest, size_t dest_len)
         src++;
     }
     dest[len] = '\0';
-    
+
     return src;
 }
 
