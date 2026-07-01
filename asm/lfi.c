@@ -1191,8 +1191,8 @@ restart:
             lfi_report_error(true, "LFI: failed to find unused GPR for stack spilling");
             return;
         }
-        /* Emit push spill_reg */
-        parse_line_fmt(&(pre_load[pre_idx++]), bits, "push %s", regName(spill_reg));
+        /* Spill spill_reg to context slot 24 */
+        parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov [%s + 24], %s", regName(LFI_CTXREG), regName(spill_reg));
     }
 
     /* 1. Pre-load virtual r11/r14/r15 into physical scratch r11 (and spill_reg if needed) for memory operands,
@@ -1364,8 +1364,8 @@ restart:
     }
 
     if (use_spill) {
-        /* Emit pop spill_reg */
-        parse_line_fmt(&(post_store[post_idx++]), bits, "pop %s", regName(spill_reg));
+        /* Restore spill_reg from context slot 24 */
+        parse_line_fmt(&(post_store[post_idx++]), bits, "mov %s, [%s + 24]", regName(spill_reg), regName(LFI_CTXREG));
     }
 
     *pre_count = pre_idx;

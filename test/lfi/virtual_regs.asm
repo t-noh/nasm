@@ -85,20 +85,20 @@ _start:
     ; 5.1. Double-virtual memory operand (Memory-Memory Collision)
     ; Requires 1 spill (rax) to load r15 and r14.
     vpbroadcastd xmm0, [r15 + r14*4]
-    ; CHECK:      push rax
+    ; CHECK:      mov qword ptr [r15+0x18],rax
     ; CHECK-NEXT: mov r11,QWORD PTR [r15+0x38]
     ; CHECK-NEXT: mov rax,QWORD PTR [r15+0x30]
     ; CHECK-NEXT: vpbroadcastd xmm0,DWORD PTR gs:[r11d+eax*4]
-    ; CHECK-NEXT: pop rax
+    ; CHECK-NEXT: mov rax,qword ptr [r15+0x18]
 
     ; 5.2. Memory-Register Collision (read-write destination)
     ; Requires 1 spill (rax) to load r15 (mem) and r14 (dest).
     cmovnz r14, [r15]
-    ; CHECK:      push rax
+    ; CHECK:      mov qword ptr [r15+0x18],rax
     ; CHECK-NEXT: mov r11,QWORD PTR [r15+0x38]
     ; CHECK-NEXT: mov rax,QWORD PTR [r15+0x30]
     ; CHECK-NEXT: cmovne rax,QWORD PTR gs:[r11d]
     ; CHECK-NEXT: mov QWORD PTR [r15+0x30],rax
-    ; CHECK-NEXT: pop rax
+    ; CHECK-NEXT: mov rax,qword ptr [r15+0x18]
 
 
