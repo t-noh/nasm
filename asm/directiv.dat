@@ -59,6 +59,8 @@ section
 segment
 static
 warning
+bundle_lock
+bundle_unlock
 
 ; --- Common output directives/pragmas
 prefix

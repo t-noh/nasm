@@ -449,6 +449,20 @@ bool process_directives(char *directive)
 	break;
     }
 
+    case D_BUNDLE_LOCK:
+    {
+        bool align_to_end = false;
+        if (value && strcasecmp(value, "align_to_end") == 0) {
+            align_to_end = true;
+        }
+        nasm_bundle_lock(align_to_end);
+        break;
+    }
+
+    case D_BUNDLE_UNLOCK:
+        nasm_bundle_unlock();
+        break;
+
     case D_ABSOLUTE:        /* [ABSOLUTE address] */
     {
 	expr *e;

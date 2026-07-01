@@ -1740,6 +1740,7 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
             erropt.never |= ERR_PASS2;
 
         reset_global_defaults(cmd_sb);
+        nasm_bundle_pass_start();
 
         cpu = cmd_cpu;
         if (listname) {

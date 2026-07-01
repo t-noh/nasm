@@ -52,4 +52,8 @@ static inline bool op_compile_rel(const insn * const ins,
     return op->segment == ins->loc.segment;
 }
 
+void nasm_bundle_lock(bool align_to_end);
+void nasm_bundle_unlock(void);
+void nasm_bundle_pass_start(void);
+
 #endif

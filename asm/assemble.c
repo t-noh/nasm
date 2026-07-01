@@ -15,6 +15,7 @@
 #include "nasmlib.h"
 #include "error.h"
 #include "assemble.h"
+#include "labels.h"
 #include "insns.h"
 #include "tables.h"
 #include "disp8.h"
@@ -4155,4 +4156,123 @@ void process_insn(insn *ins)
         nasm_nonfatalf(ERR_PASS2, "TIMES value %"PRId32" is negative",
                        ins->times);
     }
+}
+
+static void nasm_emit_nops(int count)
+{
+    if (count <= 0)
+        return;
+
+    if (pass_final()) {
+        struct out_data odata;
+        memset(&odata, 0, sizeof(odata));
+        odata.loc = location;
+        odata.type = OUT_RAWDATA;
+        odata.size = count;
+
+        uint8_t *nop_buf = nasm_malloc(count);
+        memset(nop_buf, 0x90, count);
+        odata.data = nop_buf;
+
+        odata.tsegment = NO_SEG;
+        odata.twrt = NO_SEG;
+
+        odata.legacy.data = odata.data;
+        odata.legacy.type = odata.type;
+        odata.legacy.size = odata.size;
+        odata.legacy.tsegment = odata.tsegment;
+        odata.legacy.twrt = odata.twrt;
+
+        ofmt->output(&odata);
+        nasm_free(nop_buf);
+    }
+    location.offset += count;
+}
+
+typedef struct {
+    uint32_t size;
+    bool size_known;
+    bool align_to_end;
+} bundle_block_t;
+
+static bundle_block_t *bundle_blocks = NULL;
+static int bundle_blocks_count = 0;
+static int bundle_blocks_allocated = 0;
+
+static int current_bundle_block_idx = 0;
+static bool in_bundle_lock = false;
+static int64_t bundle_lock_start_offset = 0;
+
+void nasm_bundle_pass_start(void)
+{
+    current_bundle_block_idx = 0;
+    in_bundle_lock = false;
+}
+
+void nasm_bundle_lock(bool align_to_end)
+{
+    if (in_bundle_lock) {
+        nasm_nonfatal("Nested [bundle_lock] is not allowed");
+        return;
+    }
+    in_bundle_lock = true;
+    bundle_lock_start_offset = location.offset;
+
+    if (current_bundle_block_idx >= bundle_blocks_count) {
+        if (bundle_blocks_count >= bundle_blocks_allocated) {
+            bundle_blocks_allocated = bundle_blocks_allocated ? bundle_blocks_allocated * 2 : 16;
+            bundle_blocks = nasm_realloc(bundle_blocks, bundle_blocks_allocated * sizeof(bundle_block_t));
+        }
+        bundle_blocks[bundle_blocks_count].size = 0;
+        bundle_blocks[bundle_blocks_count].size_known = false;
+        bundle_blocks[bundle_blocks_count].align_to_end = align_to_end;
+        bundle_blocks_count++;
+    } else {
+        bundle_blocks[current_bundle_block_idx].align_to_end = align_to_end;
+    }
+
+    bundle_block_t *block = &bundle_blocks[current_bundle_block_idx];
+    if (block->size_known) {
+        uint32_t size = block->size;
+        int64_t offset = location.offset;
+        uint32_t padding = 0;
+
+        if (block->align_to_end) {
+            padding = (32 - (offset + size) % 32) % 32;
+        } else {
+            uint32_t space_left = 32 - (offset % 32);
+            if (size > space_left) {
+                padding = space_left;
+            }
+        }
+
+        if (padding > 0) {
+            nasm_emit_nops(padding);
+            bundle_lock_start_offset = location.offset;
+        }
+    }
+}
+
+void nasm_bundle_unlock(void)
+{
+    if (!in_bundle_lock) {
+        nasm_nonfatal("[bundle_unlock] without matching [bundle_lock]");
+        return;
+    }
+    in_bundle_lock = false;
+
+    uint32_t size = location.offset - bundle_lock_start_offset;
+
+    if (current_bundle_block_idx < bundle_blocks_count) {
+        bundle_block_t *block = &bundle_blocks[current_bundle_block_idx];
+        if (!block->size_known || block->size != size) {
+             global_offset_changed = 1;
+             block->size = size;
+        }
+        block->size_known = true;
+    } else {
+        nasm_nonfatal("Bundle block count mismatch in unlock");
+    }
+
+    current_bundle_block_idx++;
 }
