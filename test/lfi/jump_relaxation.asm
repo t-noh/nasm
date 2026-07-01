@@ -24,12 +24,12 @@ _start:
     ; Target is defined BEFORE the jump, short distance.
     ; Stripped of SHORT flag, compiles to a secure 5-byte near jump in LFI.
     ; =========================================================================
-.t1:
-.s1:
-    jmp short .t1
-.e1:
+..@t1:
+..@s1:
+    jmp short ..@t1
+..@e1:
     ; Load the size of the jump instruction. Should be 5!
-    mov rax, (.e1 - .s1)
+    mov rax, (..@e1 - ..@s1)
     ; CHECK: mov eax,0x5
 
     ; =========================================================================
@@ -37,12 +37,12 @@ _start:
     ; Target is defined AFTER the jump, short distance.
     ; Stripped of SHORT flag, compiles to a secure 5-byte near jump in LFI.
     ; =========================================================================
-.s2:
-    jmp short .t2
-.e2:
-.t2:
+..@s2:
+    jmp short ..@t2
+..@e2:
+..@t2:
     ; Load the size of the jump instruction. Should be 5!
-    mov rbx, (.e2 - .s2)
+    mov rbx, (..@e2 - ..@s2)
     ; CHECK: mov ebx,0x5
 
     ; =========================================================================
@@ -50,13 +50,13 @@ _start:
     ; Target is defined BEFORE the jump, but separated by 150 bytes of padding.
     ; Under normal compilation, this fails. Under LFI, it is relaxed to a 5-byte near jump.
     ; =========================================================================
-.t3:
+..@t3:
     times 150 nop
-.s3:
-    jmp short .t3
-.e3:
+..@s3:
+    jmp short ..@t3
+..@e3:
     ; Load the size of the jump instruction. Should be 5!
-    mov rcx, (.e3 - .s3)
+    mov rcx, (..@e3 - ..@s3)
     ; CHECK: mov ecx,0x5
 
     ; =========================================================================
@@ -64,11 +64,11 @@ _start:
     ; Target is defined AFTER the jump, but separated by 150 bytes of padding.
     ; Under normal compilation, this fails. Under LFI, it is relaxed to a 5-byte near jump.
     ; =========================================================================
-.s4:
-    jmp short .t4
-.e4:
+..@s4:
+    jmp short ..@t4
+..@e4:
     times 150 nop
-.t4:
+..@t4:
     ; Load the size of the jump instruction. Should be 5!
-    mov rdx, (.e4 - .s4)
+    mov rdx, (..@e4 - ..@s4)
     ; CHECK: mov edx,0x5

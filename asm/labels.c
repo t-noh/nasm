@@ -446,6 +446,23 @@ bool declare_label(const char *label, enum label_type type, const char *special)
     return declare_label_lptr(lptr, type, special);
 }
 
+static bool lfi_should_align_label(const char *label)
+{
+    /* Global labels are always aligned */
+    if (label[0] != '.')
+        return true;
+
+    /* Local labels: align only if it's a user-defined local label */
+    if (label[1] == '.')
+        return false; /* Starts with .. (macro local or special symbol) */
+    if (strchr(label, '@'))
+        return false; /* Contains @ (macro local) */
+    if (strncmp(label, ".Ltmp", 5) == 0)
+        return false; /* LFI temporary label */
+
+    return true;
+}
+
 /*
  * The "normal" argument decides if we should update the local segment
  * base name or not.
@@ -455,7 +472,7 @@ void define_label(const char *label, int32_t segment,
 {
     union label *lptr;
 
-    if (lfi_mode && segment && lfi_is_code_segment(segment) && !is_local_label(label)) {
+    if (lfi_mode && segment && lfi_is_code_segment(segment) && lfi_should_align_label(label)) {
         int paddingRequired = (32 - (offset % 32)) % 32;
         if (paddingRequired > 0) {
             lfi_emit_nops(segment, paddingRequired);
