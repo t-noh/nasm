@@ -77,6 +77,8 @@ static void parse_line_fmt(insn *ret, int bits, const char *fmt, ...)
  */
 typedef uint8_t bundle_lock_mask_t;
 
+static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask);
+
 /* =========================================================================
  * 1. Low-Level Register and Memory Helper Utilities
  * ========================================================================= */
@@ -104,6 +106,30 @@ static enum reg_enum get_64bit_parent(enum reg_enum reg)
         default: return reg;
     }
 }
+
+static enum reg_enum get_32bit_reg_enum(enum reg_enum reg)
+{
+    switch (get_64bit_parent(reg)) {
+        case R_RAX: return R_EAX;
+        case R_RBX: return R_EBX;
+        case R_RCX: return R_ECX;
+        case R_RDX: return R_EDX;
+        case R_RSI: return R_ESI;
+        case R_RDI: return R_EDI;
+        case R_RBP: return R_EBP;
+        case R_RSP: return R_ESP;
+        case R_R8:  return R_R8D;
+        case R_R9:  return R_R9D;
+        case R_R10: return R_R10D;
+        case R_R11: return R_R11D;
+        case R_R12: return R_R12D;
+        case R_R13: return R_R13D;
+        case R_R14: return R_R14D;
+        case R_R15: return R_R15D;
+        default: return reg;
+    }
+}
+
 
 /* Get the 32-bit counterpart register name for any given x86 register */
 static const char *get_32bit_reg_name(enum reg_enum reg)
@@ -225,227 +251,89 @@ static bool is_memload(insn *ins, int mem_index)
     return false;
 }
 
-/* Helper to get the NASM size specifier string (e.g. "qword ", "dword ", etc.) */
-static const char *get_operand_size_specifier(operand *op)
+
+static void update_mem_operand_subclass_flags(operand *op)
 {
-    opflags_t type = op->type;
-    if (type & BITS8)   return "byte ";
-    if (type & BITS16)  return "word ";
-    if (type & BITS32)  return "dword ";
-    if (type & BITS64)  return "qword ";
-    if (type & BITS128) return "oword ";
-    if (type & BITS256) return "yword ";
-    if (type & BITS512) return "zword ";
-    return ""; /* Default: no size specifier */
+    /* Preserve size flags and modifiers (bits 32-63) */
+    opflags_t size_flags = op->type & ~OP_GENMASK(32, 0);
+    
+    /* Clear OPTYPE, REG_CLASS, and SUBCLASS flags (bits 0-31) */
+    op->type &= ~OP_GENMASK(32, 0);
+    
+    /* Call the parser's type setup logic to rebuild them correctly */
+    mref_set_optype(op);
+    
+    /* Restore size flags */
+    op->type |= size_flags;
 }
 
-/* Helper to format a normal memory operand (without GS segment override) */
-static void get_normal_memstr(operand *op, char *dest)
+static void init_insn(insn *ins)
 {
-    const char *sizeSpec = get_operand_size_specifier(op);
-    const char *base_name = (op->basereg != R_none) ? regName(op->basereg) : NULL;
-    const char *index_name = (op->indexreg != R_none) ? regName(op->indexreg) : NULL;
-
-    char base_part[64] = "";
-    if (base_name) {
-        strcpy(base_part, base_name);
+    memset(ins, 0, sizeof(insn));
+    for (int i = 0; i < MAX_OPERANDS; i++) {
+        ins->oprs[i].basereg = R_none;
+        ins->oprs[i].indexreg = R_none;
+        ins->oprs[i].segment = NO_SEG;
+        ins->oprs[i].wrt = NO_SEG;
+        ins->oprs[i].opidx = i;
     }
-
-    char index_part[64] = "";
-    if (index_name) {
-        const char *plus = (base_name) ? "+" : "";
-        if (op->scale > 1) {
-            sprintf(index_part, "%s%s*%d", plus, index_name, op->scale);
-        } else {
-            sprintf(index_part, "%s%s", plus, index_name);
-        }
-    }
-
-    char offset_part[64] = "";
-    if (op->offset != 0 || (!base_name && !index_name)) {
-        const char *plus = (base_name || index_name) ? "+" : "";
-        if (op->offset > 0) {
-            sprintf(offset_part, "%s%ld", plus, op->offset);
-        } else if (op->offset < 0) {
-            sprintf(offset_part, "%ld", op->offset);
-        } else {
-            strcpy(offset_part, "0");
-        }
-    }
-
-    sprintf(dest, "%s[%s%s%s]", sizeSpec, base_part, index_part, offset_part);
 }
 
-/* Format an operand (register, immediate, or memory) as a string */
-static void get_operand_string_rep(operand *op, char *dest)
+static void build_tls_mem_operand(operand *fsOp, enum reg_enum scratch_reg, bool use_gs, operand *dest)
 {
-    if (is_op_type(*op, REGISTER)) {
-        strcpy(dest, regName(op->basereg));
-    } else if (is_op_type(*op, IMMEDIATE)) {
-        sprintf(dest, "%ld", op->offset);
-    } else if (is_op_type(*op, MEMORY)) {
-        get_normal_memstr(op, dest); /* Support memory operands! */
+    *dest = *fsOp;
+    dest->type = MEMORY | (fsOp->type & SIZE_MASK);
+    dest->eaflags &= ~(EAF_FS | EAF_GS); /* Clear segment flags */
+    dest->hintbase = -1;
+    dest->hinttype = EAH_NOHINT;
+    if (use_gs) {
+        dest->eaflags |= EAF_GS;
+    }
+
+    enum reg_enum scratch = use_gs ? get_32bit_reg_enum(scratch_reg) : scratch_reg;
+    enum reg_enum orig_base = fsOp->basereg;
+    enum reg_enum orig_index = fsOp->indexreg;
+
+    if (use_gs) {
+        if (orig_base != R_none) orig_base = get_32bit_reg_enum(orig_base);
+        if (orig_index != R_none) orig_index = get_32bit_reg_enum(orig_index);
+    }
+
+    if (orig_base != R_none && orig_index != R_none) {
+        nasm_fatal("LFI: TLS memory operand has both base and index registers, cannot add scratch");
+    }
+
+    dest->basereg = scratch;
+    if (orig_base != R_none) {
+        dest->indexreg = orig_base;
+        dest->scale = 1;
+    } else if (orig_index != R_none) {
+        dest->indexreg = orig_index;
+        dest->scale = fsOp->scale;
     } else {
-        strcpy(dest, "");
+        dest->indexreg = R_none;
     }
+
+    update_mem_operand_subclass_flags(dest);
 }
 
-/* Format a sandboxed memory reference string using GS segment and 32-bit registers */
-static void get_segue_memstr(operand *op, char *dest)
+static void rewrite_nosegue_mem_operand(insn *ins, int mem_index, enum reg_enum scratch_reg, insn *dest)
 {
-    const char *sizeSpec = get_operand_size_specifier(op);
-    const char *base_name = (op->basereg != R_none) ? get_32bit_reg_name(op->basereg) : NULL;
-    const char *index_name = (op->indexreg != R_none) ? get_32bit_reg_name(op->indexreg) : NULL;
-
-    char base_part[64] = "";
-    if (base_name) {
-        strcpy(base_part, base_name);
-    }
-
-    char index_part[64] = "";
-    if (index_name) {
-        const char *plus = (base_name) ? "+" : "";
-        if (op->scale > 1) {
-            sprintf(index_part, "%s%s*%d", plus, index_name, op->scale);
-        } else {
-            sprintf(index_part, "%s%s", plus, index_name);
-        }
-    }
-
-    char offset_part[64] = "";
-    if (op->offset != 0 || (!base_name && !index_name)) {
-        const char *plus = (base_name || index_name) ? "+" : "";
-        if (op->offset > 0) {
-            sprintf(offset_part, "%s%ld", plus, op->offset);
-        } else if (op->offset < 0) {
-            sprintf(offset_part, "%ld", op->offset);
-        } else {
-            /* offset is 0, but no base or index registers are present (i.e. absolute address 0) */
-            strcpy(offset_part, "0");
-        }
-    }
-
-    sprintf(dest, "%sgs:[%s%s%s]", sizeSpec, base_part, index_part, offset_part);
+    *dest = *ins;
+    dest->times = 1;
+    operand *op = &dest->oprs[mem_index];
+    op->basereg = LFI_SBX_BASE;   /* R_R14 */
+    op->indexreg = get_64bit_parent(scratch_reg); /* Scratch reg must be 64-bit */
+    op->scale = 1;
+    op->offset = 0;
+    op->segment = NO_SEG;
+    op->eaflags &= ~(EAF_FS | EAF_GS | EAF_REL);
+    update_mem_operand_subclass_flags(op);
 }
 
-/* Helper to parse an instruction with its operand strings, preserving the LOCK prefix if present. */
-static void parse_insn_ops(insn *ins, insn *dest, const char *op0, const char *op1, const char *op2)
+static void build_nosegue_addr_insn(operand *memOp, enum reg_enum dest_reg, insn *dest, int bits)
 {
-    int bits = ins->bits;
-    const char *instrName = nasm_insn_names[ins->opcode];
-
-    /* Prepend LOCK prefix if present */
-    bool hasLock = false;
-    for (int i = 0; i < MAXPREFIX; i++) {
-        if (ins->prefixes[i] == P_LOCK) {
-            hasLock = true;
-            break;
-        }
-    }
-    const char *lockPrefix = hasLock ? "lock " : "";
-
-    if (ins->operands == 1) {
-        parse_line_fmt(dest, bits, "%s%s %s", lockPrefix, instrName, op0);
-    } else if (ins->operands == 2) {
-        parse_line_fmt(dest, bits, "%s%s %s,%s", lockPrefix, instrName, op0, op1);
-    } else if (ins->operands == 3) {
-        parse_line_fmt(dest, bits, "%s%s %s,%s,%s", lockPrefix, instrName, op0, op1, op2);
-    }
-}
-
-/* Rewrite a memory-accessing instruction in-place to use GS segment override */
-static void rewrite_gs_mem(insn *ins, int mem_index, insn *dest)
-{
-    char opsStr[3][256];
-    for (int i = 0; i < ins->operands; i++) {
-        if (i == mem_index) {
-            get_segue_memstr(&ins->oprs[i], opsStr[i]);
-        } else {
-            get_operand_string_rep(&ins->oprs[i], opsStr[i]);
-        }
-    }
-    parse_insn_ops(ins, dest, opsStr[0], opsStr[1], opsStr[2]);
-}
-
-/* Format the TLS memory operand string: gs:[scratch32 + base32 + offset] or [scratch64 + base64 + offset] */
-static void get_tls_memstr(operand *op, enum reg_enum scratch, bool use_gs, char *dest)
-{
-    const char *seg = use_gs ? "gs:" : "";
-    const char *scratch_name = use_gs ? get_32bit_reg_name(scratch) : regName(scratch);
-
-    char base_part[64] = "";
-    if (op->basereg != R_none) {
-        const char *base_name = use_gs ? get_32bit_reg_name(op->basereg) : regName(op->basereg);
-        sprintf(base_part, "+%s", base_name);
-    }
-
-    char index_part[64] = "";
-    if (op->indexreg != R_none) {
-        const char *index_name = use_gs ? get_32bit_reg_name(op->indexreg) : regName(op->indexreg);
-        if (op->scale > 1) {
-            sprintf(index_part, "+%s*%d", index_name, op->scale);
-        } else {
-            sprintf(index_part, "+%s", index_name);
-        }
-    }
-
-    char offset_part[64] = "";
-    if (op->offset != 0) {
-        if (op->offset > 0) {
-            sprintf(offset_part, "+%ld", op->offset);
-        } else {
-            sprintf(offset_part, "%ld", op->offset);
-        }
-    }
-
-    sprintf(dest, "%s[%s%s%s%s]", seg, scratch_name, base_part, index_part, offset_part);
-}
-
-/* Format an explicit base addition memory operand string [base + index*scale + offset] */
-static void get_explicit_memstr(operand *op, enum reg_enum base, enum reg_enum index, int scale, int64_t offset, char *dest)
-{
-    const char *sizeSpec = get_operand_size_specifier(op);
-    const char *base_name = (base != R_none) ? regName(base) : NULL;
-    const char *index_name = (index != R_none) ? regName(index) : NULL;
-
-    char base_part[64] = "";
-    if (base_name) {
-        strcpy(base_part, base_name);
-    }
-
-    char index_part[64] = "";
-    if (index_name) {
-        const char *plus = (base_name) ? "+" : "";
-        if (scale > 1) {
-            sprintf(index_part, "%s%s*%d", plus, index_name, scale);
-        } else {
-            sprintf(index_part, "%s%s", plus, index_name);
-        }
-    }
-
-    char offset_part[64] = "";
-    if (offset != 0 || (!base_name && !index_name)) {
-        const char *plus = (base_name || index_name) ? "+" : "";
-        if (offset > 0) {
-            sprintf(offset_part, "%s%ld", plus, offset);
-        } else if (offset < 0) {
-            sprintf(offset_part, "%ld", offset);
-        } else {
-            strcpy(offset_part, "0");
-        }
-    }
-
-    sprintf(dest, "%s[%s%s%s]", sizeSpec, base_part, index_part, offset_part);
-}
-
-/*
- * Calculate the no-segue 32-bit effective address from a memory operand.
- *
- * If the base is already the sandbox base (%r14), we omit it from the 32-bit
- * address calculation (preventing 2*r14 base additions at runtime).
- */
-static void get_nosegue_addr(operand *memOp, const char *scratch32, char *instStr)
-{
+    enum reg_enum dest_reg32 = get_32bit_reg_enum(dest_reg);
     enum reg_enum baseReg = memOp->basereg;
     enum reg_enum indexReg = memOp->indexreg;
     int scale = memOp->scale;
@@ -455,46 +343,63 @@ static void get_nosegue_addr(operand *memOp, const char *scratch32, char *instSt
         baseReg = R_none;
     }
 
+    init_insn(dest);
+    dest->bits = bits;
+
     /* Optimization: If it's a simple register copy, use MOV instead of LEA */
     if (offset == 0 && indexReg == R_none && baseReg != R_none) {
-        sprintf(instStr, "mov %s,%s", scratch32, get_32bit_reg_name(baseReg));
+        dest->opcode = I_MOV;
+        dest->operands = 2;
+        dest->oprs[0].type = nasm_reg_flags[dest_reg32];
+        dest->oprs[0].basereg = dest_reg32;
+        dest->oprs[1].type = nasm_reg_flags[get_32bit_reg_enum(baseReg)];
+        dest->oprs[1].basereg = get_32bit_reg_enum(baseReg);
     } else if (offset == 0 && baseReg == R_none && indexReg != R_none && scale == 1) {
-        sprintf(instStr, "mov %s,%s", scratch32, get_32bit_reg_name(indexReg));
+        dest->opcode = I_MOV;
+        dest->operands = 2;
+        dest->oprs[0].type = nasm_reg_flags[dest_reg32];
+        dest->oprs[0].basereg = dest_reg32;
+        dest->oprs[1].type = nasm_reg_flags[get_32bit_reg_enum(indexReg)];
+        dest->oprs[1].basereg = get_32bit_reg_enum(indexReg);
     } else {
-        /* Assemble the inner effective address parts declaratively */
-        const char *base_name = (baseReg != R_none) ? regName(baseReg) : NULL;
-        const char *index_name = (indexReg != R_none) ? regName(indexReg) : NULL;
-
-        char base_part[64] = "";
-        if (base_name) {
-            strcpy(base_part, base_name);
+        dest->opcode = I_LEA;
+        dest->operands = 2;
+        dest->oprs[0].type = nasm_reg_flags[dest_reg32];
+        dest->oprs[0].basereg = dest_reg32;
+        
+        dest->oprs[1] = *memOp;
+        dest->oprs[1].type = (dest->oprs[1].type & ~SIZE_MASK) | BITS64; // Keep 64-bit address size
+        if (dest->oprs[1].basereg == LFI_SBX_BASE) {
+            dest->oprs[1].basereg = R_none;
         }
-
-        char index_part[64] = "";
-        if (index_name) {
-            const char *plus = (base_name) ? "+" : "";
-            if (scale > 1) {
-                sprintf(index_part, "%s%s*%d", plus, index_name, scale);
-            } else {
-                sprintf(index_part, "%s%s", plus, index_name);
-            }
-        }
-
-        char offset_part[64] = "";
-        if (offset != 0 || (!base_name && !index_name)) {
-            const char *plus = (base_name || index_name) ? "+" : "";
-            if (offset > 0) {
-                sprintf(offset_part, "%s%ld", plus, offset);
-            } else if (offset < 0) {
-                sprintf(offset_part, "%ld", offset);
-            } else {
-                strcpy(offset_part, "0");
-            }
-        }
-
-        sprintf(instStr, "lea %s,[%s%s%s]", scratch32, base_part, index_part, offset_part);
+        update_mem_operand_subclass_flags(&dest->oprs[1]);
     }
 }
+
+
+
+/* Mutate a memory operand in-place to Segue mode (adds GS override and downcasts to 32-bit) */
+static void mutate_segue_mem_operand(operand *op)
+{
+    op->eaflags |= EAF_GS;
+    if (op->basereg != R_none) {
+        op->basereg = get_32bit_reg_enum(op->basereg);
+    }
+    if (op->indexreg != R_none) {
+        op->indexreg = get_32bit_reg_enum(op->indexreg);
+    }
+    update_mem_operand_subclass_flags(op);
+}
+
+/* Mutate an instruction's memory operand to Segue mode */
+static void rewrite_segue_mem_operand(insn *ins, int mem_index, insn *dest)
+{
+    *dest = *ins;
+    dest->times = 1;
+    mutate_segue_mem_operand(&dest->oprs[mem_index]);
+    dest->prefixes[PPS_SEG] = R_GS;
+}
+
 
 /* =========================================================================
  * 2. Specialized Instruction Expansion & Rewrite Helpers
@@ -563,20 +468,20 @@ static void rewrite_rsp_update(insn *ins, int *count, insn *ret, bundle_lock_mas
         const char *loweredReg = get_32bit_reg_name(ins->oprs[1].basereg);
         parse_line_fmt(&(ret[0]), bits, "%s esp,%s", instrName, loweredReg);
     } else if (is_op_type(ins->oprs[1], MEMORY)) {
-        char memoryStringRep[256];
         if (!lfi_no_segue) {
-            get_segue_memstr(&ins->oprs[1], memoryStringRep);
+            rewrite_segue_mem_operand(ins, 1, &(ret[0]));
+            ret[0].oprs[0].type = nasm_reg_flags[R_ESP];
+            ret[0].oprs[0].basereg = R_ESP;
         } else {
-            get_explicit_memstr(&ins->oprs[1], LFI_SBX_BASE, LFI_SCRATCH_REG, 1, 0, memoryStringRep);
             *count = 3;
             *bundle_lock_mask = 0b0110;
-            char preLoad[128];
-            const char *scratch32 = get_32bit_reg_name(LFI_SCRATCH_REG);
-            get_nosegue_addr(&ins->oprs[1], scratch32, preLoad);
-            parse_line(preLoad, &(ret[0]), bits);
+            build_nosegue_addr_insn(&ins->oprs[1], LFI_SCRATCH_REG, &(ret[0]), bits);
             ret++; /* shift ret pointer for the next instruction */
+            
+            rewrite_nosegue_mem_operand(ins, 1, LFI_SCRATCH_REG, &(ret[0]));
+            ret[0].oprs[0].type = nasm_reg_flags[R_ESP];
+            ret[0].oprs[0].basereg = R_ESP;
         }
-        parse_line_fmt(&(ret[0]), bits, "%s esp,%s", instrName, memoryStringRep);
     } else {
         nasm_fatal("LFI: Unexpected operand type in RSP manipulation");
     }
@@ -610,63 +515,51 @@ static void rewrite_rsp_lea(insn *ins, int *count, insn *ret, bundle_lock_mask_t
     parse_line_fmt(&(ret[1]), bits, "lea rsp,[rsp+%s]", sbx_base);
 }
 
+/* Helper to emit the indirect branch mask-and-jump sequence */
+static void emit_indirect_branch_seq(enum reg_enum target_reg, const char *instr_name, int bits, insn *dest)
+{
+    const char *reg64 = regName(get_64bit_parent(target_reg));
+    const char *reg32 = get_32bit_reg_name(target_reg);
+    const char *sbx_base = regName(LFI_SBX_BASE);
+
+    parse_line_fmt(&(dest[0]), bits, "and %s,-32", reg32);
+    parse_line_fmt(&(dest[1]), bits, "add %s,%s", reg64, sbx_base);
+    parse_line_fmt(&(dest[2]), bits, "%s %s", instr_name, reg64);
+}
+
 /* Rewrite 5: Indirect Jumps and Calls through Register or Memory */
 static void rewrite_indirect_branch(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask)
 {
     int bits = ins->bits;
     const char *instrName = (ins->opcode == I_CALL) ? "call" : "jmp";
 
-    const char *scratch = regName(LFI_SCRATCH_REG);
-    const char *scratch32 = get_32bit_reg_name(LFI_SCRATCH_REG);
-    const char *sbx_base = regName(LFI_SBX_BASE);
-
     if (is_op_type(ins->oprs[0], REGISTER)) {
-        enum reg_enum targetReg = ins->oprs[0].basereg;
-        const char *targetReg32 = get_32bit_reg_name(targetReg);
-        const char *targetReg64 = regName(get_64bit_parent(targetReg));
-
         *count = 3;
         *bundle_lock_mask = 0b0110;
-
-        parse_line_fmt(&(ret[0]), bits, "and %s,-32", targetReg32);
-        parse_line_fmt(&(ret[1]), bits, "add %s,%s", targetReg64, sbx_base);
-        parse_line_fmt(&(ret[2]), bits, "%s %s", instrName, targetReg64);
+        emit_indirect_branch_seq(ins->oprs[0].basereg, instrName, bits, ret);
     }
     else if (is_op_type(ins->oprs[0], MEMORY)) {
-        char memoryStringRep[256];
-        bool isSafe = is_safe_memop(&ins->oprs[0]);
+        /* 1. Build a GPR memory load into the scratch register */
+        insn load_ins;
+        init_insn(&load_ins);
+        load_ins.opcode = I_MOV;
+        load_ins.operands = 2;
+        load_ins.bits = bits;
+        load_ins.oprs[0].type = nasm_reg_flags[LFI_SCRATCH_REG];
+        load_ins.oprs[0].basereg = LFI_SCRATCH_REG;
+        load_ins.oprs[1] = ins->oprs[0];
+        load_ins.oprs[1].type = (load_ins.oprs[1].type & ~SIZE_MASK) | BITS64;
 
-        if (isSafe) {
-            /* Safe memory operands (e.g. [rsp], [rbp]) do not require sandboxing the load address */
-            get_explicit_memstr(&ins->oprs[0], ins->oprs[0].basereg, ins->oprs[0].indexreg, ins->oprs[0].scale, ins->oprs[0].offset, memoryStringRep);
-            *count = 4;
-            *bundle_lock_mask = 0b1100; /* [and, add, jmp/call] are locked (bits 2,3,4) */
+        /* 2. Delegate sandboxing of this load to expand_load_store */
+        int load_count = 0;
+        bundle_lock_mask_t load_lock_mask = 0;
+        expand_load_store(&load_ins, &load_count, ret, &load_lock_mask);
 
-            parse_line_fmt(&(ret[0]), bits, "mov %s,%s", scratch, memoryStringRep);
-        } else {
-            /* Unsafe memory operands require sandboxing the load address */
-            if (!lfi_no_segue) {
-                get_segue_memstr(&ins->oprs[0], memoryStringRep);
-                *count = 4;
-                *bundle_lock_mask = 0b1100; /* [and, add, jmp/call] are locked (bits 2,3,4) */
+        /* 3. Append the branch sequence (mask, base addition, branch) */
+        emit_indirect_branch_seq(LFI_SCRATCH_REG, instrName, bits, ret + load_count);
 
-                parse_line_fmt(&(ret[0]), bits, "mov %s,%s", scratch, memoryStringRep);
-            } else {
-                get_explicit_memstr(&ins->oprs[0], LFI_SBX_BASE, LFI_SCRATCH_REG, 1, 0, memoryStringRep);
-                *count = 5;
-                *bundle_lock_mask = 0b11100; /* [mov, and, add, jmp/call] are locked (bits 3,4,5) */
-
-                char preLoad[128];
-                get_nosegue_addr(&ins->oprs[0], scratch32, preLoad);
-                parse_line(preLoad, &(ret[0]), bits);
-                parse_line_fmt(&(ret[1]), bits, "mov %s,%s", scratch, memoryStringRep);
-                ret++; /* Shift ret pointer for the remaining instructions */
-            }
-        }
-
-        parse_line_fmt(&(ret[1]), bits, "and %s,-32", scratch32);
-        parse_line_fmt(&(ret[2]), bits, "add %s,%s", scratch, sbx_base);
-        parse_line_fmt(&(ret[3]), bits, "%s %s", instrName, scratch);
+        *count = load_count + 3;
+        *bundle_lock_mask = load_lock_mask | (0b110 << load_count);
     }
 }
 
@@ -696,79 +589,43 @@ static void rewrite_syscall(insn *ins, int *count, insn *ret, bundle_lock_mask_t
     parse_line_fmt(&(ret[0]), bits, "lea %s,[rel %s]", scratch, labelStr);
     parse_line_fmt(&(ret[1]), bits, "jmp [%s]", sbx_base);
 
-    memset(&(ret[2]), 0, sizeof(insn));
+    init_insn(&(ret[2]));
     ret[2].opcode = I_none;
     ret[2].label = nasm_strdup(labelStr);
 }
 
 /* Rewrite 7: Thread-Local Storage (TLS) Reads (loads from %fs:offset) */
-static void rewrite_tlsread(insn *ins, int mem_index, int *count, insn *ret)
+/* Unify TLS Read and Write helper logic */
+static void rewrite_tls_op(insn *ins, int mem_index, bool use_gs, int *count, insn *ret)
 {
     int bits = ins->bits;
     operand *fsOp = &ins->oprs[mem_index];
 
-    const char *scratch = regName(LFI_SCRATCH_REG);
-    const char *ctxreg = regName(LFI_CTXREG);
-
-    /* Case 7a: Optimized simple thread-pointer load (e.g. mov rax, [fs:0]) */
-    if (ins->opcode == I_MOV && fsOp->offset == 0 && fsOp->basereg == R_none && fsOp->indexreg == R_none) {
+    /* Case 7a: Optimized simple thread-pointer load (e.g. mov rax, [fs:0]).
+     * We only optimize reads, not writes (writes to offset 0 are invalid/not generated).
+     */
+    bool isStore = (mem_index == 0 && ins->opcode != I_LEA);
+    if (!isStore && ins->opcode == I_MOV && fsOp->offset == 0 && fsOp->basereg == R_none && fsOp->indexreg == R_none) {
         *count = 1;
-        char opsStr[3][256];
-        for (int i = 0; i < ins->operands; i++) {
-            if (i == mem_index) {
-                sprintf(opsStr[i], "[%s+32]", ctxreg);
-            } else {
-                get_operand_string_rep(&ins->oprs[i], opsStr[i]);
-            }
-        }
-        parse_insn_ops(ins, &(ret[0]), opsStr[0], opsStr[1], opsStr[2]);
+        parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", regName(ins->oprs[0].basereg), regName(LFI_CTXREG));
         return;
     }
 
     /* Case 7b: Segment Translation -> Load thread pointer into scratch, then access */
     *count = 2;
-    parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", scratch, ctxreg);
+    
+    /* Instruction 0: mov r11, [r15 + 32] */
+    parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", regName(LFI_SCRATCH_REG), regName(LFI_CTXREG));
 
-    char tlsMemStr[256];
-    get_tls_memstr(fsOp, LFI_SCRATCH_REG, !lfi_no_loads, tlsMemStr);
-
-    /* Format the main instruction */
-    char opsStr[3][256];
-    for (int i = 0; i < ins->operands; i++) {
-        if (i == mem_index) {
-            strcpy(opsStr[i], tlsMemStr);
-        } else {
-            get_operand_string_rep(&ins->oprs[i], opsStr[i]);
-        }
+    /* Instruction 1: original instruction with mutated memory operand */
+    ret[1] = *ins;
+    ret[1].times = 1;
+    build_tls_mem_operand(fsOp, LFI_SCRATCH_REG, use_gs, &ret[1].oprs[mem_index]);
+    if (use_gs) {
+        ret[1].prefixes[PPS_SEG] = R_GS;
+    } else {
+        ret[1].prefixes[PPS_SEG] = 0;
     }
-    parse_insn_ops(ins, &(ret[1]), opsStr[0], opsStr[1], opsStr[2]);
-}
-
-/* Rewrite 8: Thread-Local Storage (TLS) Writes (stores to %fs:offset) */
-static void rewrite_tlswrite(insn *ins, int mem_index, int *count, insn *ret)
-{
-    int bits = ins->bits;
-    operand *fsOp = &ins->oprs[mem_index];
-
-    *count = 2;
-    const char *scratch = regName(LFI_SCRATCH_REG);
-    const char *ctxreg = regName(LFI_CTXREG);
-
-    parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", scratch, ctxreg);
-
-    char tlsMemStr[256];
-    get_tls_memstr(fsOp, LFI_SCRATCH_REG, true, tlsMemStr);
-
-    /* Format the main instruction (store) */
-    char opsStr[3][256];
-    for (int i = 0; i < ins->operands; i++) {
-        if (i == mem_index) {
-            strcpy(opsStr[i], tlsMemStr);
-        } else {
-            get_operand_string_rep(&ins->oprs[i], opsStr[i]);
-        }
-    }
-    parse_insn_ops(ins, &(ret[1]), opsStr[0], opsStr[1], opsStr[2]);
 }
 
 static bool uses_r15_invalidly(insn *ins)
@@ -899,13 +756,13 @@ static void expand_syscall(insn *ins, int *count, insn *ret, bundle_lock_mask_t 
 static void expand_tlsread(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask)
 {
     int mem_index = get_mem_op_index(ins);
-    rewrite_tlsread(ins, mem_index, count, ret);
+    rewrite_tls_op(ins, mem_index, !lfi_no_loads, count, ret);
     *bundle_lock_mask = 0b0000; /* TLS reads are not bundle-locked */
 }
 
 static void expand_tlswrite(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask)
 {
-    rewrite_tlswrite(ins, 0, count, ret);
+    rewrite_tls_op(ins, 0, !lfi_no_stores, count, ret);
     *bundle_lock_mask = 0b0000; /* TLS writes are not bundle-locked */
 }
 
@@ -1050,71 +907,30 @@ static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask
         goto bypass;
     }
 
-    /* 4. Segue Mode: In-place rewrite to use GS segment override */
     if (!lfi_no_segue) {
         *count = 1;
         *bundle_lock_mask = 0b0000;
-        rewrite_gs_mem(ins, mem_index, &(ret[0]));
+        rewrite_segue_mem_operand(ins, mem_index, &(ret[0]));
         return;
     }
 
     /* 5. No-Segue Mode: Explicit base addition */
     else {
-        if (isStore) {
-            char memoryStringRep[256];
-            *count = 2;
-            *bundle_lock_mask = 0b0010;
+        *count = 2;
+        *bundle_lock_mask = 0b0010;
 
-            operand *memOp = &ins->oprs[0];
-            char addressCalcStr[1024];
-            const char *scratch32 = get_32bit_reg_name(LFI_SCRATCH_REG);
-            get_nosegue_addr(memOp, scratch32, addressCalcStr);
-            parse_line(addressCalcStr, &(ret[0]), bits);
-
-            /* Format original instruction relative to SBX_BASE+SCRATCH */
-            get_explicit_memstr(memOp, LFI_SBX_BASE, LFI_SCRATCH_REG, 1, 0, memoryStringRep);
-
-            char opsStr[3][256];
-            strcpy(opsStr[0], memoryStringRep);
-            get_operand_string_rep(&ins->oprs[1], opsStr[1]);
-            get_operand_string_rep(&ins->oprs[2], opsStr[2]);
-
-            parse_insn_ops(ins, &(ret[1]), opsStr[0], opsStr[1], opsStr[2]);
-            return;
-        } else {
-            *count = 2;
-            *bundle_lock_mask = 0b0010;
-
-            operand *memOp = &ins->oprs[mem_index];
-            enum reg_enum scratchReg = LFI_SCRATCH_REG;
-
+        enum reg_enum scratchReg = LFI_SCRATCH_REG;
+        if (!isStore) {
             /* Optimization: If it is a simple MOV load, reuse the destination register as scratch */
             if (ins->opcode == I_MOV && is_op_type(ins->oprs[0], REGISTER)) {
                 scratchReg = ins->oprs[0].basereg;
             }
-
-            const char *scratch32 = get_32bit_reg_name(scratchReg);
-
-            char addressCalcStr[1024];
-            get_nosegue_addr(memOp, scratch32, addressCalcStr);
-            parse_line(addressCalcStr, &(ret[0]), bits);
-
-            /* Format original instruction relative to r14+scratch */
-            char memoryStringRep[256];
-            get_explicit_memstr(memOp, LFI_SBX_BASE, scratchReg, 1, 0, memoryStringRep);
-
-            char opsStr[3][256];
-            for (int i = 0; i < ins->operands; i++) {
-                if (i == mem_index) {
-                    strcpy(opsStr[i], memoryStringRep);
-                } else {
-                    get_operand_string_rep(&ins->oprs[i], opsStr[i]);
-                }
-            }
-
-            parse_insn_ops(ins, &(ret[1]), opsStr[0], opsStr[1], opsStr[2]);
-            return;
         }
+
+        operand *memOp = &ins->oprs[mem_index];
+        build_nosegue_addr_insn(memOp, scratchReg, &(ret[0]), bits);
+        rewrite_nosegue_mem_operand(ins, mem_index, scratchReg, &(ret[1]));
+        return;
     }
 
 bypass:
@@ -1791,7 +1607,7 @@ void lfi_process_insn(insn *ins)
 
             if (paddingSize > 0) {
                 insn noop_ins;
-                memset(&noop_ins, 0, sizeof(noop_ins));
+                init_insn(&noop_ins);
                 noop_ins.opcode = I_NOP;
                 noop_ins.times = 1;
                 noop_ins.bits = curr_ins->bits;

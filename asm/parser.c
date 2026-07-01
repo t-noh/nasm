@@ -270,7 +270,7 @@ static int parse_mref(operand *op, const expr *e)
     return 0;
 }
 
-static void mref_set_optype(operand *op)
+void mref_set_optype(operand *op)
 {
     int b = op->basereg;
     int i = op->indexreg;
