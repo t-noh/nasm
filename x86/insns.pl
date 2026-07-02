@@ -681,13 +681,7 @@ if ( $output eq 'l' ) {
         }
         if ($has_mem) {
             my $counts = join(',', sort keys %{$insn_op_counts{$insn}});
-            print L "$insn $counts";
-            for (my $i = 0; $i < scalar(@$ops); $i++) {
-                if ($ops->[$i]) {
-                    print L " $i";
-                }
-            }
-            print L "\n";
+            print L "$insn $counts\n";
         }
     }
     close L;
@@ -861,12 +855,18 @@ sub format_insn($$$$) {
 	    push(@opsize, $opsz);
             push(@decos, (@opevex ? join('|', @opevex) : '0'));
             my $can_be_mem = $ismem || $isrm || $ismoffs;
-            $insn_mem_ops{lc($opcode)}[$opnum] ||= $can_be_mem;
+            my $is_apx = ($flags{'APX'} && !$flags{'NOAPX'}) ? 1 : 0;
+            unless ($is_apx) {
+                $insn_mem_ops{lc($opcode)}[$opnum] ||= $can_be_mem;
+            }
         }
     }
 
     my $nops = scalar(@ops);
-    $insn_op_counts{lc($opcode)}{$nops} = 1;
+    my $is_apx = ($flags{'APX'} && !$flags{'NOAPX'}) ? 1 : 0;
+    unless ($is_apx) {
+        $insn_op_counts{lc($opcode)}{$nops} = 1;
+    }
 
     while (scalar(@ops) < $MAX_OPERANDS) {
         push(@ops, '0');
