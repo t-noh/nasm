@@ -310,7 +310,8 @@ USE: lfi
 %endmacro
 
 ;; Generic binary op with write dest (may modify rsp, may access memory)
-%imacro LFI_BINARY_OP_WRITE 3
+%imacro LFI_BINARY_OP 3
+    [warning -pp-macro-params-multi]
     %defstr %%dest_str %2
     %ifidn %%dest_str, "rsp"
         %push stack_mod_ctx
@@ -417,10 +418,12 @@ USE: lfi
         %endif
         %pop
     %endif
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; Generic binary op with read-only dest (may access memory)
-%imacro LFI_BINARY_OP_READ 3
+%imacro LFI_BINARY_OP_RO 3
+    [warning -pp-macro-params-multi]
     %push mem_check_ctx
     is_mem %2
     %assign %%op1_mem %$is_mem
@@ -465,10 +468,12 @@ USE: lfi
         %1 %2, %3
     %endif
     %pop
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; Generic unary op with write dest (may modify rsp, may access memory)
 %imacro LFI_UNARY_OP 2
+    [warning -pp-macro-params-multi]
     %defstr %%op_str %2
     %ifidn %%op_str, "rsp"
         [bundle_lock]
@@ -501,10 +506,12 @@ USE: lfi
         %endif
         %pop
     %endif
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; Generic unary op with read-only dest (may access memory)
-%imacro LFI_UNARY_OP_READ 2
+%imacro LFI_UNARY_OP_RO 2
+    [warning -pp-macro-params-multi]
     %push mem_check_ctx
     is_mem %2
     %assign %%is_mem %$is_mem
@@ -529,10 +536,12 @@ USE: lfi
         %1 %2
     %endif
     %pop
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; Indirect control flow (jmp/call)
 %imacro LFI_INDIRECT_FLOW 3 ; op, target, lock_directive
+    [warning -pp-macro-params-multi]
     %push ind_flow_ctx
     is_reg64 %2
     %if %$is_reg64
@@ -570,10 +579,12 @@ USE: lfi
         %endif
     %endif
     %pop
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; Ternary operations (e.g. 3-operand vector or GPR instructions)
-%imacro LFI_TERNARY_OP_WRITE 4 ; op, op1, op2, op3
+%imacro LFI_TERNARY_OP 4 ; op, op1, op2, op3
+    [warning -pp-macro-params-multi]
     %push mem_check_ctx
     is_mem %2
     %assign %%op1_mem %$is_mem
@@ -661,6 +672,7 @@ USE: lfi
         %1 %2, %3, %4
     %endif
     %pop
+    [warning +pp-macro-params-multi]
 %endmacro
 
 ;; --- Instruction Overrides ---
