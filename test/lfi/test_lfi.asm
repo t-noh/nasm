@@ -21,6 +21,10 @@ section .text
     xorpd xmm0, [rax]       ; Rewrite: lea r11d, [rax]; xorpd xmm0, [r14 + r11*1]
     movaps [rdx], xmm1      ; Rewrite: lea r11d, [rdx]; movaps [r14 + r11*1], xmm1
     prefetcht0 [rax]        ; Rewrite: lea r11d, [rax]; prefetcht0 [r14 + r11*1]
+    imul rdx, [rax], 10     ; Rewrite: [bundle_lock] lea edx, [rax]; imul rdx, [r14+rdx*1], 10 [bundle_unlock]
+    shld [rax], rbx, 5      ; Rewrite: [bundle_lock] lea r11d, [rax]; shld [r14+r11*1], rbx, 5 [bundle_unlock]
+    vaddpd xmm1, xmm2, [rax] ; Rewrite: [bundle_lock] lea r11d, [rax]; vaddpd xmm1, xmm2, [r14+r11*1] [bundle_unlock]
+
 
     ;; Size prefix preservation
     mov dword [rax], ebx    ; Rewrite: lea r11d, [rax]; mov dword [r14 + r11*1], ebx

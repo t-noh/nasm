@@ -52,7 +52,13 @@ foreach my $op (sort keys %insns_with_mem) {
     foreach my $count (@counts) {
         next if $generated{$count};
 
-        if ($count == 2) {
+        if ($count == 3) {
+            # We assume 3-operand instructions are write-dest (true for AVX/BMI1)
+            print $out "%imacro $op 3\n";
+            print $out "    LFI_TERNARY_OP_WRITE $op, %1, %2, %3\n";
+            print $out "%endmacro\n\n";
+            $generated{$count} = 1;
+        } elsif ($count == 2) {
             if ($read_only_binary{$op}) {
                 print $out "%imacro $op 2\n";
                 print $out "    LFI_BINARY_OP_READ $op, %1, %2\n";
@@ -75,7 +81,7 @@ foreach my $op (sort keys %insns_with_mem) {
             }
             $generated{$count} = 1;
         }
-        # We silently skip count 0, 3+ for now.
+        # We silently skip count 0, 4+ for now.
     }
 }
 

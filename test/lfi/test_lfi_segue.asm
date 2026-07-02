@@ -22,6 +22,10 @@ section .text
     xorpd xmm0, [rax]       ; Rewrite: xorpd xmm0, [gs:eax]
     movaps [rdx], xmm1      ; Rewrite: movaps [gs:edx], xmm1
     prefetcht0 [rax]        ; Rewrite: prefetcht0 [gs:eax]
+    imul rdx, [rax], 10     ; Rewrite: imul rdx, [gs:eax], 10
+    shld [rax], rbx, 5      ; Rewrite: shld [gs:eax], rbx, 5
+    vaddpd xmm1, xmm2, [rax] ; Rewrite: vaddpd xmm1, xmm2, [gs:eax]
+
 
     ;; Size prefix preservation
     mov dword [rax], ebx    ; Rewrite: mov dword [gs:eax], ebx

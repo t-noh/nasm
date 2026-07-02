@@ -572,6 +572,97 @@ USE: lfi
     %pop
 %endmacro
 
+;; Ternary operations (e.g. 3-operand vector or GPR instructions)
+%imacro LFI_TERNARY_OP_WRITE 4 ; op, op1, op2, op3
+    %push mem_check_ctx
+    is_mem %2
+    %assign %%op1_mem %$is_mem
+    is_mem %3
+    %assign %%op2_mem %$is_mem
+    is_mem %4
+    %assign %%op3_mem %$is_mem
+    
+    %if %%op1_mem
+        HANDLE_TLS %2, %%op_tls
+        is_safe_mem %%op_tls
+        %if %$is_safe == 0
+            %if LFI_USE_SEGUE
+                REWRITE_MEM_OP_SEGUE %%op_tls, %%rewritten_op
+                %1 %%rewritten_op, %3, %4
+            %else
+                [bundle_lock]
+                lea r11d, %%op_tls
+                REWRITE_MEM_OP %%op_tls, %%rewritten_op, r11
+                %1 %%rewritten_op, %3, %4
+                [bundle_unlock]
+            %endif
+        %else
+            %1 %%op_tls, %3, %4
+        %endif
+    %elif %%op2_mem
+        HANDLE_TLS %3, %%op_tls
+        is_safe_mem %%op_tls
+        %if %$is_safe == 0
+            %if LFI_USE_SEGUE
+                REWRITE_MEM_OP_SEGUE %%op_tls, %%rewritten_op
+                %1 %2, %%rewritten_op, %4
+            %else
+                is_reg64 %2
+                %if %$is_reg64
+                    ;; Optimize: Use GPR64 dest register %2 as scratch
+                    rewrite_reg_to_32 %2
+                    %xdefine %%scratch_32 %$result
+                    [bundle_lock]
+                    lea %%scratch_32, %%op_tls
+                    REWRITE_MEM_OP %%op_tls, %%rewritten_op, %2
+                    %1 %2, %%rewritten_op, %4
+                    [bundle_unlock]
+                %else
+                    ;; Fallback to r11 (e.g. if dest is XMM)
+                    [bundle_lock]
+                    lea r11d, %%op_tls
+                    REWRITE_MEM_OP %%op_tls, %%rewritten_op, r11
+                    %1 %2, %%rewritten_op, %4
+                    [bundle_unlock]
+                %endif
+            %endif
+        %else
+            %1 %2, %%op_tls, %4
+        %endif
+    %elif %%op3_mem
+        HANDLE_TLS %4, %%op_tls
+        is_safe_mem %%op_tls
+        %if %$is_safe == 0
+            %if LFI_USE_SEGUE
+                REWRITE_MEM_OP_SEGUE %%op_tls, %%rewritten_op
+                %1 %2, %3, %%rewritten_op
+            %else
+                is_reg64 %2
+                %if %$is_reg64
+                    rewrite_reg_to_32 %2
+                    %xdefine %%scratch_32 %$result
+                    [bundle_lock]
+                    lea %%scratch_32, %%op_tls
+                    REWRITE_MEM_OP %%op_tls, %%rewritten_op, %2
+                    %1 %2, %3, %%rewritten_op
+                    [bundle_unlock]
+                %else
+                    [bundle_lock]
+                    lea r11d, %%op_tls
+                    REWRITE_MEM_OP %%op_tls, %%rewritten_op, r11
+                    %1 %2, %3, %%rewritten_op
+                    [bundle_unlock]
+                %endif
+            %endif
+        %else
+            %1 %2, %3, %%op_tls
+        %endif
+    %else
+        %1 %2, %3, %4
+    %endif
+    %pop
+%endmacro
+
 ;; --- Instruction Overrides ---
 
 
