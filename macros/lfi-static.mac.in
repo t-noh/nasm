@@ -532,13 +532,13 @@ USE: lfi
 %endmacro
 
 ;; Indirect control flow (jmp/call)
-%imacro LFI_INDIRECT_FLOW 2
+%imacro LFI_INDIRECT_FLOW 3 ; op, target, lock_directive
     %push ind_flow_ctx
     is_reg64 %2
     %if %$is_reg64
         rewrite_reg_to_32 %2
         %xdefine %%reg32 %$result
-        [bundle_lock]
+        %3
         and %%reg32, -32
         add %2, r14
         %1 %2
@@ -550,13 +550,13 @@ USE: lfi
             %if LFI_USE_SEGUE
                 REWRITE_MEM_OP_SEGUE %%op_tls, %$rewritten_op
                 mov r11, %$rewritten_op
-                [bundle_lock]
+                %3
                 and r11d, -32
                 add r11, r14
                 %1 r11
                 [bundle_unlock]
             %else
-                [bundle_lock]
+                %3
                 lea r11d, %%op_tls
                 REWRITE_MEM_OP %%op_tls, %$rewritten_op, r11
                 mov r11, %$rewritten_op
@@ -695,11 +695,11 @@ USE: lfi
 %endmacro
 
 %imacro jmp 1
-    LFI_INDIRECT_FLOW jmp, %1
+    LFI_INDIRECT_FLOW jmp, %1, [bundle_lock]
 %endmacro
 
 %imacro call 1
-    LFI_INDIRECT_FLOW call, %1
+    LFI_INDIRECT_FLOW call, %1, [bundle_lock align_to_end]
 %endmacro
 
 %imacro ret 0
