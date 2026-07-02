@@ -1,0 +1,431 @@
+;; macros/lfi.mac - LFI Sandboxing Macros
+USE: lfi
+
+;; 32-bit register mappings
+%define reg32_rax eax
+%define reg32_rbx ebx
+%define reg32_rcx ecx
+%define reg32_rdx edx
+%define reg32_rsi esi
+%define reg32_rdi edi
+%define reg32_rbp ebp
+%define reg32_rsp esp
+%define reg32_r8 r8d
+%define reg32_r9 r9d
+%define reg32_r10 r10d
+%define reg32_r11 r11d
+%define reg32_r12 r12d
+%define reg32_r13 r13d
+%define reg32_r14 r14d
+%define reg32_r15 r15d
+
+;; Helper to check if operand is a 64-bit register
+%imacro is_reg64 1
+    %push is_reg64_ctx
+    %assign %$is_reg 0
+    %defstr %%str %1
+    %ifidn %%str, "rax"
+        %assign %$is_reg 1
+    %elifidn %%str, "rbx"
+        %assign %$is_reg 1
+    %elifidn %%str, "rcx"
+        %assign %$is_reg 1
+    %elifidn %%str, "rdx"
+        %assign %$is_reg 1
+    %elifidn %%str, "rsi"
+        %assign %$is_reg 1
+    %elifidn %%str, "rdi"
+        %assign %$is_reg 1
+    %elifidn %%str, "rbp"
+        %assign %$is_reg 1
+    %elifidn %%str, "rsp"
+        %assign %$is_reg 1
+    %elifidn %%str, "r8"
+        %assign %$is_reg 1
+    %elifidn %%str, "r9"
+        %assign %$is_reg 1
+    %elifidn %%str, "r10"
+        %assign %$is_reg 1
+    %elifidn %%str, "r11"
+        %assign %$is_reg 1
+    %elifidn %%str, "r12"
+        %assign %$is_reg 1
+    %elifidn %%str, "r13"
+        %assign %$is_reg 1
+    %elifidn %%str, "r14"
+        %assign %$is_reg 1
+    %elifidn %%str, "r15"
+        %assign %$is_reg 1
+    %endif
+    %assign %%res %$is_reg
+    %pop
+    %assign %$is_reg64 %%res
+%endmacro
+
+;; Helper to rewrite register to 32-bit
+%imacro rewrite_reg_to_32 1
+    %ifdef reg32_%1
+        %xdefine %$result reg32_%1
+    %else
+        %define %$result %1
+    %endif
+%endmacro
+
+;; Helper to find char in string
+%imacro find_char 3
+    %push find_char_ctx
+    %defstr %%s %1
+    %defstr %%c %2
+    %strlen %%len %%s
+    %assign %$index 0
+    %assign %%idx 1
+    %rep 1000
+        %if %%idx > %%len
+            %exitrep
+        %endif
+        %substr %%part %%s %%idx, 1
+        %ifidn %%part, %%c
+            %assign %$index %%idx
+            %exitrep
+        %endif
+        %assign %%idx %%idx + 1
+    %endrep
+    %assign %%res %$index
+    %pop
+    %assign %3 %%res
+%endmacro
+
+;; Helper to check if string contains substring
+%imacro str_contains 2
+    %push contains_ctx
+    %assign %$contains 0
+    %defstr %%s %1
+    %defstr %%sub %2
+    %strlen %%s_len %%s
+    %strlen %%sub_len %%sub
+    
+    %if %%s_len >= %%sub_len
+        %assign %%idx 1
+        %assign %%limit %%s_len - %%sub_len + 1
+        %rep 1000
+            %if %%idx > %%limit
+                %exitrep
+            %endif
+            %substr %%part %%s %%idx, %%sub_len
+            %ifidn %%part, %%sub
+                %assign %$contains 1
+                %exitrep
+            %endif
+            %assign %%idx %%idx + 1
+        %endrep
+    %endif
+    %assign %%res %$contains
+    %pop
+    %assign %$contains_res %%res
+%endmacro
+
+;; Helper to check if operand is memory
+%imacro is_mem 1
+    %push is_mem_ctx
+    %defstr %%str %1
+    %strlen %%len %%str
+    %assign %$is_mem 0
+    %if %%len > 2
+        %substr %%last %%str %%len
+        %ifidn %%last, "]"
+            str_contains %1, [
+            %if %$contains_res
+                %assign %$is_mem 1
+            %endif
+        %endif
+    %endif
+    %assign %%res %$is_mem
+    %pop
+    %assign %$is_mem %%res
+%endmacro
+
+;; Helper to check if memory operand is safe
+%imacro is_safe_mem 1
+    %push is_safe_ctx
+    %assign %$is_safe 0
+    
+    str_contains %1, rsp
+    %if %$contains_res
+        %assign %$is_safe 1
+    %endif
+    
+    str_contains %1, rbp
+    %if %$contains_res
+        %assign %$is_safe 1
+    %endif
+    
+    str_contains %1, rel
+    %if %$contains_res
+        %assign %$is_safe 1
+    %endif
+    
+    str_contains %1, :
+    %if %$contains_res
+        %assign %$is_safe 1
+    %endif
+
+    str_contains %1, r14
+    %if %$contains_res
+        %assign %$is_safe 1
+    %endif
+    
+    %assign %%res %$is_safe
+    %pop
+    %assign %$is_safe %%res
+%endmacro
+
+;; Helper to rewrite memory operand
+%imacro REWRITE_MEM_OP 2
+    %push rewrite_mem_ctx
+    %defstr %%str %1
+    find_char %1, [, %%bracket_idx
+    %if %%bracket_idx > 1
+        %assign %%prefix_len %%bracket_idx - 1
+        %substr %%prefix_str %%str 1, %%prefix_len
+        %strcat %%new_op_str %%prefix_str "[r14 + r11*1]"
+        %deftok %%new_op %%new_op_str
+    %else
+        %define %%new_op [r14 + r11*1]
+    %endif
+    %define %%res %%new_op
+    %pop
+    %define %2 %%res
+%endmacro
+
+;; Generic binary op with write dest (may modify rsp, may access memory)
+%imacro LFI_BINARY_OP_WRITE 3
+    %defstr %%dest_str %2
+    %ifidn %%dest_str, "rsp"
+        %push stack_mod_ctx
+        rewrite_reg_to_32 %3
+        %xdefine %%val32 %$result
+        %pop
+        [bundle_lock]
+        %1 esp, %%val32
+        db 0x4a, 0x8d, 0x24, 0x34 ; lea rsp, [rsp + r14]
+        [bundle_unlock]
+    %else
+        %push mem_check_ctx
+        is_mem %2
+        %assign %%op1_mem %$is_mem
+        is_mem %3
+        %assign %%op2_mem %$is_mem
+        
+        %if %%op1_mem
+            is_safe_mem %2
+            %if %$is_safe == 0
+                [bundle_lock]
+                lea r11d, %2
+                REWRITE_MEM_OP %2, %$rewritten_op
+                %1 %$rewritten_op, %3
+                [bundle_unlock]
+            %else
+                %1 %2, %3
+            %endif
+        %elif %%op2_mem
+            is_safe_mem %3
+            %if %$is_safe == 0
+                [bundle_lock]
+                lea r11d, %3
+                REWRITE_MEM_OP %3, %$rewritten_op
+                %1 %2, %$rewritten_op
+                [bundle_unlock]
+            %else
+                %1 %2, %3
+            %endif
+        %else
+            %1 %2, %3
+        %endif
+        %pop
+    %endif
+%endmacro
+
+;; Generic binary op with read-only dest (may access memory)
+%imacro LFI_BINARY_OP_READ 3
+    %push mem_check_ctx
+    is_mem %2
+    %assign %%op1_mem %$is_mem
+    is_mem %3
+    %assign %%op2_mem %$is_mem
+    
+    %if %%op1_mem
+        is_safe_mem %2
+        %if %$is_safe == 0
+            [bundle_lock]
+            lea r11d, %2
+            REWRITE_MEM_OP %2, %$rewritten_op
+            %1 %$rewritten_op, %3
+            [bundle_unlock]
+        %else
+            %1 %2, %3
+        %endif
+    %elif %%op2_mem
+        is_safe_mem %3
+        %if %$is_safe == 0
+            [bundle_lock]
+            lea r11d, %3
+            REWRITE_MEM_OP %3, %$rewritten_op
+            %1 %2, %$rewritten_op
+            [bundle_unlock]
+        %else
+            %1 %2, %3
+        %endif
+    %else
+        %1 %2, %3
+    %endif
+    %pop
+%endmacro
+
+;; Generic unary op with write dest (may modify rsp, may access memory)
+%imacro LFI_UNARY_OP 2
+    %defstr %%op_str %2
+    %ifidn %%op_str, "rsp"
+        [bundle_lock]
+        %1 esp
+        db 0x4a, 0x8d, 0x24, 0x34 ; lea rsp, [rsp + r14]
+        [bundle_unlock]
+    %else
+        %push mem_check_ctx
+        is_mem %2
+        %assign %%is_mem %$is_mem
+        %if %%is_mem
+            is_safe_mem %2
+            %if %$is_safe == 0
+                [bundle_lock]
+                lea r11d, %2
+                REWRITE_MEM_OP %2, %$rewritten_op
+                %1 %$rewritten_op
+                [bundle_unlock]
+            %else
+                %1 %2
+            %endif
+        %else
+            %1 %2
+        %endif
+        %pop
+    %endif
+%endmacro
+
+;; Generic unary op with read-only dest (may access memory)
+%imacro LFI_UNARY_OP_READ 2
+    %push mem_check_ctx
+    is_mem %2
+    %assign %%is_mem %$is_mem
+    %if %%is_mem
+        is_safe_mem %2
+        %if %$is_safe == 0
+            [bundle_lock]
+            lea r11d, %2
+            REWRITE_MEM_OP %2, %$rewritten_op
+            %1 %$rewritten_op
+            [bundle_unlock]
+        %else
+            %1 %2
+        %endif
+    %else
+        %1 %2
+    %endif
+    %pop
+%endmacro
+
+;; Indirect control flow (jmp/call)
+%imacro LFI_INDIRECT_FLOW 2
+    %push ind_flow_ctx
+    is_reg64 %2
+    %if %$is_reg64
+        rewrite_reg_to_32 %2
+        %xdefine %%reg32 %$result
+        [bundle_lock]
+        and %%reg32, -32
+        add %2, r14
+        %1 %2
+        [bundle_unlock]
+    %else
+        is_mem %2
+        %if %$is_mem
+            [bundle_lock]
+            lea r11d, %2
+            REWRITE_MEM_OP %2, %$rewritten_op
+            mov r11, %$rewritten_op
+            and r11d, -32
+            add r11, r14
+            %1 r11
+            [bundle_unlock]
+        %else
+            %1 %2
+        %endif
+    %endif
+    %pop
+%endmacro
+
+;; --- Instruction Overrides ---
+
+
+
+%imacro pop 1
+    %defstr %%op_str %1
+    %ifidn %%op_str, "rsp"
+        [bundle_lock]
+        pop r11
+        mov esp, r11d
+        db 0x4a, 0x8d, 0x24, 0x34 ; lea rsp, [rsp + r14]
+        [bundle_unlock]
+    %else
+        LFI_UNARY_OP pop, %1
+    %endif
+%endmacro
+
+
+
+%imacro lea 2
+    %defstr %%dest_str %1
+    %ifidn %%dest_str, "rsp"
+        [bundle_lock]
+        lea esp, %2
+        db 0x4a, 0x8d, 0x24, 0x34 ; lea rsp, [rsp + r14]
+        [bundle_unlock]
+    %else
+        lea %1, %2
+    %endif
+%endmacro
+
+%imacro jmp 1
+    LFI_INDIRECT_FLOW jmp, %1
+%endmacro
+
+%imacro call 1
+    LFI_INDIRECT_FLOW call, %1
+%endmacro
+
+%imacro ret 0
+    [bundle_lock]
+    pop r11
+    and r11d, -32
+    add r11, r14
+    db 0x41, 0xff, 0xe3 ; jmp r11
+    [bundle_unlock]
+%endmacro
+
+%imacro ret 1
+    [bundle_lock]
+    pop r11
+    and r11d, -32
+    add r11, r14
+    add esp, %1
+    db 0x4a, 0x8d, 0x24, 0x34 ; lea rsp, [rsp + r14]
+    db 0x41, 0xff, 0xe3 ; jmp r11
+    [bundle_unlock]
+%endmacro
+
+%imacro syscall 0
+    [bundle_lock]
+    lea r11, [rel %%sys_ret]
+    db 0x41, 0xff, 0x26 ; jmp [r14]
+    %%sys_ret:
+    [bundle_unlock]
+%endmacro

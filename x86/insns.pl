@@ -372,7 +372,7 @@ print STDERR "Reading insns.dat...\n";
 undef $output;
 foreach $arg ( @ARGV ) {
     if ( $arg =~ /^\-/ ) {
-        if  ( $arg =~ /^\-([abdin]|f[hc])$/ ) {
+        if  ( $arg =~ /^\-([abdinl]|f[hc])$/ ) {
             $output = $1;
         } else {
             die "$0: Unknown option: ${arg}\n";
@@ -389,6 +389,8 @@ open(F, '<', $fname) || die "unable to open $fname";
 
 @bytecode_list = ();
 %aname = ();
+my %insn_mem_ops = ();
+my %insn_op_counts = ();
 
 $line = 0;
 $insns = 0;
@@ -666,6 +668,31 @@ if ( $output eq 'n' ) {
     close N;
 }
 
+if ( $output eq 'l' ) {
+    print STDERR "Writing $oname...\n";
+
+    open(L, '>', $oname);
+
+    foreach my $insn (sort keys %insn_mem_ops) {
+        my $ops = $insn_mem_ops{$insn};
+        my $has_mem = 0;
+        foreach my $can_mem (@$ops) {
+            if ($can_mem) { $has_mem = 1; last; }
+        }
+        if ($has_mem) {
+            my $counts = join(',', sort keys %{$insn_op_counts{$insn}});
+            print L "$insn $counts";
+            for (my $i = 0; $i < scalar(@$ops); $i++) {
+                if ($ops->[$i]) {
+                    print L " $i";
+                }
+            }
+            print L "\n";
+        }
+    }
+    close L;
+}
+
 if ( $output eq 'fh') {
     write_iflaggen_h();
 }
@@ -833,10 +860,13 @@ sub format_insn($$$$) {
             push(@ops, $op);
 	    push(@opsize, $opsz);
             push(@decos, (@opevex ? join('|', @opevex) : '0'));
+            my $can_be_mem = $ismem || $isrm || $ismoffs;
+            $insn_mem_ops{lc($opcode)}[$opnum] ||= $can_be_mem;
         }
     }
 
     my $nops = scalar(@ops);
+    $insn_op_counts{lc($opcode)}{$nops} = 1;
 
     while (scalar(@ops) < $MAX_OPERANDS) {
         push(@ops, '0');
