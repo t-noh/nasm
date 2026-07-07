@@ -43,3 +43,32 @@ jobs:
           name: travis-log
           path: travis.log
           if-no-files-found: warn
+
+  build-msvc:
+    name: Build with MSVC (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build with nmake/cl.exe
+        shell: cmd
+        run: |
+          nmake /f Mkfiles\msvc.mak
+
+      - name: Smoke-test the resulting binaries
+        shell: cmd
+        run: |
+          nasm.exe --version
+          ndisasm.exe --version
+          echo mov eax, 1 > smoke.asm
+          echo ret >> smoke.asm
+          nasm.exe -f bin smoke.asm -o smoke.bin
+          ndisasm.exe -b 64 smoke.bin
+          nasm.exe -f win64 smoke.asm -o smoke.obj
