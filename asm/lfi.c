@@ -83,6 +83,33 @@ static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask
  * 1. Low-Level Register and Memory Helper Utilities
  * ========================================================================= */
 
+static bool is_vector_reg(enum reg_enum reg)
+{
+    if (reg == R_none) return false;
+    opflags_t flags = nasm_reg_flags[reg];
+    opflags_t reg_class = flags & REG_CLASS_MASK;
+    return (reg_class == REG_CLASS_RM_XMM ||
+            reg_class == REG_CLASS_RM_YMM ||
+            reg_class == REG_CLASS_RM_ZMM);
+}
+
+static bool is_lfi_unsafe_vsib(const insn *ins)
+{
+    switch (ins->opcode) {
+        case I_VPGATHERDQ:
+        case I_VPGATHERQQ:
+        case I_VPSCATTERDQ:
+        case I_VPSCATTERQQ:
+        case I_VGATHERQPD:
+        case I_VGATHERQPS:
+        case I_VSCATTERQPD:
+        case I_VSCATTERQPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* Map any GPR register to its 64-bit parent */
 static enum reg_enum get_64bit_parent(enum reg_enum reg)
 {
@@ -874,6 +901,35 @@ static void expand_string_op(insn *ins, int *count, insn *ret, bundle_lock_mask_
     }
 }
 
+/* Build address pre-calculation instructions for VSIB under No-Segue mode.
+ * Returns the number of instructions generated (0 or 2). */
+static int build_vsib_nosegue_addr_insns(const operand *memOp, insn *dest, int bits)
+{
+    if (memOp->basereg == R_none) {
+        return 0;
+    }
+
+    enum reg_enum base32 = get_32bit_reg_enum(memOp->basereg);
+    parse_line_fmt(&(dest[0]), bits, "mov r11d, %s", regName(base32));
+    parse_line_fmt(&(dest[1]), bits, "add r11, %s", regName(LFI_SBX_BASE));
+    return 2;
+}
+
+/* Rewrite VSIB memory operand in the target instruction to use sandboxed base. */
+static void rewrite_vsib_nosegue_mem_operand(const insn *ins, int mem_index, insn *dest)
+{
+    *dest = *ins;
+    dest->times = 1;
+    operand *op = &dest->oprs[mem_index];
+    if (op->basereg == R_none) {
+        op->basereg = LFI_SBX_BASE;
+    } else {
+        op->basereg = LFI_SCRATCH_REG;
+    }
+    op->eaflags &= ~(EAF_FS | EAF_GS | EAF_REL);
+    update_mem_operand_subclass_flags(op);
+}
+
 static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask_t *bundle_lock_mask)
 {
     int bits = ins->bits;
@@ -916,6 +972,22 @@ static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask
 
     /* 5. No-Segue Mode: Explicit base addition */
     else {
+        operand *memOp = &ins->oprs[mem_index];
+
+        if (is_vector_reg(memOp->indexreg)) {
+            /* VSIB addressing mode */
+            if (is_lfi_unsafe_vsib(ins)) {
+                lfi_report_error(true, "LFI: gather/scatter with 64-bit indices is not supported in No-Segue mode (unsafe indices)");
+                goto bypass;
+            }
+
+            int addr_count = build_vsib_nosegue_addr_insns(memOp, &(ret[0]), bits);
+            rewrite_vsib_nosegue_mem_operand(ins, mem_index, &(ret[addr_count]));
+            *count = addr_count + 1;
+            *bundle_lock_mask = (addr_count == 2) ? 0b0110 : 0b0000;
+            return;
+        }
+
         *count = 2;
         *bundle_lock_mask = 0b0010;
 
@@ -927,7 +999,6 @@ static void expand_load_store(insn *ins, int *count, insn *ret, bundle_lock_mask
             }
         }
 
-        operand *memOp = &ins->oprs[mem_index];
         build_nosegue_addr_insn(memOp, scratchReg, &(ret[0]), bits);
         rewrite_nosegue_mem_operand(ins, mem_index, scratchReg, &(ret[1]));
         return;
