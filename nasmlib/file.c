@@ -45,7 +45,8 @@
  */
 #ifdef _WIN32
 #include <wchar.h>
-#include <stringapiset.h>
+/* <windows.h> (which brings in MultiByteToWideChar()/CompareStringOrdinal()
+   via <stringapiset.h>) is already included by "compiler.h". */
 
 typedef wchar_t *os_filename;
 typedef wchar_t  os_fopenflag;

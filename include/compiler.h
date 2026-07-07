@@ -24,6 +24,22 @@
 /* On Microsoft platforms we support multibyte character sets in filenames */
 #define _MBCS 1
 
+/*
+ * On Windows, a number of source files need Windows API declarations
+ * (e.g. MultiByteToWideChar(), CompareStringOrdinal()) that live in SDK
+ * headers such as <stringapiset.h>.  Those headers are only guaranteed
+ * to work when included via the normal <windows.h> pipeline, which sets
+ * up SDK-internal architecture macros (_X86_, _AMD64_, ...) that plain
+ * compiler-provided macros (_M_IX86, _M_X64, ...) do not satisfy on
+ * their own; including them directly can fail with "No Target
+ * Architecture" errors from <winnt.h>.  Pull in <windows.h> once, here,
+ * before anything else gets a chance to jump the queue.
+ */
+#ifdef _WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
+
 #include "autoconf/attribute.h"
 
 #ifdef HAVE_CONFIG_H
