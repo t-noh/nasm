@@ -61,6 +61,7 @@ static bool keep_all;
 
 bool tasm_compatible_mode = false;
 bool lfi_mode = false;
+bool lfi_evaluating_direct_branch = false;
 bool lfi_no_segue = false;
 bool lfi_no_loads = false;
 bool lfi_no_stores = false;

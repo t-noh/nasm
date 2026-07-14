@@ -27,9 +27,8 @@ _start:
 ..@t1:
 ..@s1:
     jmp short ..@t1
-..@e1:
-    ; Load the size of the jump instruction. Should be 5!
-    mov rax, (..@e1 - ..@s1)
+    ; Use location counter ($ - ..@s1) to measure exact jump instruction size (5 bytes)
+    mov rax, ($ - ..@s1)
     ; CHECK: mov eax,0x5
 
     ; =========================================================================
@@ -39,11 +38,9 @@ _start:
     ; =========================================================================
 ..@s2:
     jmp short ..@t2
-..@e2:
-..@t2:
-    ; Load the size of the jump instruction. Should be 5!
-    mov rbx, (..@e2 - ..@s2)
+    mov rbx, ($ - ..@s2)
     ; CHECK: mov ebx,0x5
+..@t2:
 
     ; =========================================================================
     ; Test Case 3: Backward Long Jump (exceeds 127 bytes)
@@ -54,9 +51,7 @@ _start:
     times 150 nop
 ..@s3:
     jmp short ..@t3
-..@e3:
-    ; Load the size of the jump instruction. Should be 5!
-    mov rcx, (..@e3 - ..@s3)
+    mov rcx, ($ - ..@s3)
     ; CHECK: mov ecx,0x5
 
     ; =========================================================================
@@ -66,9 +61,7 @@ _start:
     ; =========================================================================
 ..@s4:
     jmp short ..@t4
-..@e4:
+    mov rdx, ($ - ..@s4)
+    ; CHECK: mov edx,0x5
     times 150 nop
 ..@t4:
-    ; Load the size of the jump instruction. Should be 5!
-    mov rdx, (..@e4 - ..@s4)
-    ; CHECK: mov edx,0x5

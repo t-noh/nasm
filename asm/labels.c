@@ -84,6 +84,7 @@ union label {                   /* actual label structures */
         const char *def_file;   /* Where defined */
         int32_t def_line;
         enum label_type type, mangled_type;
+        bool address_taken;
     } defn;
     struct {
         int32_t movingon;
@@ -245,7 +246,11 @@ enum label_type lookup_label(const char *label,
     if (!initialized)
         return LBL_none;
 
-    lptr = find_label(label, false, NULL);
+    lptr = find_label(label, true, NULL);
+    if (lptr && !lfi_evaluating_direct_branch) {
+        lptr->defn.address_taken = true;
+    }
+
     if (lptr && lptr->defn.defined) {
         int64_t lpass = pass_count() + 1;
 
@@ -446,21 +451,19 @@ bool declare_label(const char *label, enum label_type type, const char *special)
     return declare_label_lptr(lptr, type, special);
 }
 
-static bool lfi_should_align_label(const char *label)
+static bool lfi_should_align_label(union label *lptr)
 {
     /* Global labels are always aligned */
-    if (label[0] != '.')
+    if (is_global(lptr->defn.type))
         return true;
 
-    /* Local labels: align only if it's a user-defined local label */
-    if (label[1] == '.')
-        return false; /* Starts with .. (macro local or special symbol) */
-    if (strchr(label, '@'))
-        return false; /* Contains @ (macro local) */
-    if (strncmp(label, ".Ltmp", 5) == 0)
-        return false; /* LFI temporary label */
+    /* Exclude internal LFI compiler-generated syscall return labels */
+    if (strncmp(lptr->defn.label, ".Llfi_sys_ret_", 14) == 0 ||
+        strstr(lptr->defn.label, ".Llfi_sys_ret_") != NULL)
+        return false;
 
-    return true;
+    /* Local labels: align only if address was taken in value/data context */
+    return lptr->defn.address_taken;
 }
 
 /*
@@ -471,17 +474,19 @@ void define_label(const char *label, int32_t segment,
                   int64_t offset, bool normal)
 {
     union label *lptr;
+    bool created, changed, largechange;
+    int64_t size;
+    int64_t lpass, lastdef;
 
-    if (lfi_mode && segment && lfi_is_code_segment(segment) && lfi_should_align_label(label)) {
+    lptr = find_label(label, true, &created);
+
+    if (lfi_mode && segment && lfi_is_code_segment(segment) && lfi_should_align_label(lptr)) {
         int paddingRequired = (32 - (offset % 32)) % 32;
         if (paddingRequired > 0) {
             lfi_emit_nops(segment, paddingRequired);
             offset += paddingRequired;
         }
     }
-    bool created, changed, largechange;
-    int64_t size;
-    int64_t lpass, lastdef;
 
     /*
      * The backend may invoke this during initialization, at which
@@ -495,8 +500,6 @@ void define_label(const char *label, int32_t segment,
      * or the offset changes. Increment global_offset_changed when that
      * happens, to tell the assembler core to make another pass.
      */
-    lptr = find_label(label, true, &created);
-
     lastdef = lptr->defn.defined;
 
     if (segment) {

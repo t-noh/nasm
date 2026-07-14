@@ -7,6 +7,7 @@
 #include "nasm.h"
 
 extern bool lfi_mode;
+extern bool lfi_evaluating_direct_branch;
 
 void lfi_process_insn(insn *ins);
 void lfi_emit_nops(int32_t segment, int count);

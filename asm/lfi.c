@@ -608,7 +608,7 @@ static void rewrite_syscall(insn *ins, int *count, insn *ret, bundle_lock_mask_t
 
     /* Generate a unique local label for return address */
     char labelStr[64];
-    sprintf(labelStr, ".Ltmp_sys%d", syscall_label_counter++);
+    sprintf(labelStr, ".Llfi_sys_ret_%d", syscall_label_counter++);
 
     const char *scratch = regName(LFI_SCRATCH_REG);
     const char *sbx_base = regName(LFI_SBX_BASE);

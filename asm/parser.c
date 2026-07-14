@@ -19,6 +19,14 @@
 #include "floats.h"
 #include "assemble.h"
 #include "tables.h"
+#include "lfi.h"
+
+static bool is_branch_instruction(enum opcode opcode)
+{
+    if (opcode < 0) return false;
+    const char *name = nasm_insn_names[opcode];
+    return name && (name[0] == 'j' || strcmp(name, "call") == 0 || strncmp(name, "loop", 4) == 0);
+}
 
 
 static int end_expression_next(void);
@@ -1083,8 +1091,10 @@ restart_parse:
             }
         }
 
+        lfi_evaluating_direct_branch = is_branch_instruction(result->opcode) && !mref;
         value = evaluate(stdscan, NULL, &tokval,
                          &op->opflags, critical, &hints);
+        lfi_evaluating_direct_branch = false;
         i = tokval.t_type;
         if (!value)                  /* Error in evaluator */
             goto fail;
