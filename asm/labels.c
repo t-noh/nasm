@@ -478,6 +478,10 @@ void define_label(const char *label, int32_t segment,
     int64_t size;
     int64_t lpass, lastdef;
 
+    if (lfi_mode && segment && lfi_is_code_segment(segment)) {
+        offset = lfi_handle_label_teardown(label, segment, offset);
+    }
+
     lptr = find_label(label, true, &created);
 
     if (lfi_mode && segment && lfi_is_code_segment(segment) && lfi_should_align_label(lptr)) {
@@ -591,6 +595,10 @@ void define_label(const char *label, int32_t segment,
 
     if (lastdef != lpass)
         out_symdef(lptr);
+
+    if (lfi_mode && segment && lfi_is_code_segment(segment)) {
+        lfi_handle_label_setup(label, segment);
+    }
 }
 
 /*

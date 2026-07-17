@@ -634,15 +634,15 @@ static void rewrite_tls_op(insn *ins, int mem_index, bool use_gs, int *count, in
     bool isStore = (mem_index == 0 && ins->opcode != I_LEA);
     if (!isStore && ins->opcode == I_MOV && fsOp->offset == 0 && fsOp->basereg == R_none && fsOp->indexreg == R_none) {
         *count = 1;
-        parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", regName(ins->oprs[0].basereg), regName(LFI_CTXREG));
+        parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+16]", regName(ins->oprs[0].basereg), regName(LFI_CTXREG));
         return;
     }
 
     /* Case 7b: Segment Translation -> Load thread pointer into scratch, then access */
     *count = 2;
     
-    /* Instruction 0: mov r11, [r15 + 32] */
-    parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+32]", regName(LFI_SCRATCH_REG), regName(LFI_CTXREG));
+    /* Instruction 0: mov r11, [r15 + 16] */
+    parse_line_fmt(&(ret[0]), bits, "mov %s,[%s+16]", regName(LFI_SCRATCH_REG), regName(LFI_CTXREG));
 
     /* Instruction 1: original instruction with mutated memory operand */
     ret[1] = *ins;
@@ -668,11 +668,11 @@ static bool uses_r15_invalidly(insn *ins)
             }
         }
 
-        /* Memory Operand: R15 is allowed ONLY as a base register with offset 32 */
+        /* Memory Operand: R15 is allowed ONLY as a base register with offset 16 */
         if (is_op_type(*op, MEMORY)) {
             if (op->basereg != R_none) {
                 enum reg_enum parent = get_64bit_parent(op->basereg);
-                if (parent == LFI_CTXREG && op->offset != 32) {
+                if (parent == LFI_CTXREG && op->offset != 16) {
                     return true;
                 }
             }
@@ -1236,6 +1236,8 @@ static enum reg_enum find_unused_gpr(insn *ins)
     return R_none;
 }
 
+static int lfi_get_unused_spill_offset(void);
+
 /* Prepare register virtualization by generating loads/stores and rewriting to physical registers */
 static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn *post_store, int *post_count)
 {
@@ -1247,6 +1249,7 @@ static void prepare_virtual_regs(insn *ins, insn *pre_load, int *pre_count, insn
     int scratch_offset = 0;
 
     bool use_spill = false;
+    int spill_offset = 24;
     enum reg_enum spill_reg = R_none;
     insn orig_ins = *ins;
 
@@ -1262,8 +1265,9 @@ restart:
             lfi_report_error(true, "LFI: failed to find unused GPR for stack spilling");
             return;
         }
-        /* Spill spill_reg to context slot 24 */
-        parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov [%s + 24], %s", regName(LFI_CTXREG), regName(spill_reg));
+        spill_offset = lfi_get_unused_spill_offset();
+        /* Spill spill_reg to context slot */
+        parse_line_fmt(&(pre_load[pre_idx++]), bits, "mov [%s + %d], %s", regName(LFI_CTXREG), spill_offset, regName(spill_reg));
     }
 
     /* 1. Pre-load virtual r11/r14/r15 into physical scratch r11 (and spill_reg if needed) for memory operands,
@@ -1436,7 +1440,7 @@ restart:
 
     if (use_spill) {
         /* Restore spill_reg from context slot 24 */
-        parse_line_fmt(&(post_store[post_idx++]), bits, "mov %s, [%s + 24]", regName(spill_reg), regName(LFI_CTXREG));
+        parse_line_fmt(&(post_store[post_idx++]), bits, "mov %s, [%s + %d]", regName(spill_reg), regName(LFI_CTXREG), spill_offset);
     }
 
     *pre_count = pre_idx;
@@ -1475,6 +1479,398 @@ static void dispatch_expand(insn *ins, int *count, insn *ret, bundle_lock_mask_t
     }
 }
 
+/* =========================================================================
+ * Basic-Block Register Reallocation Data Structures & Helpers
+ * ========================================================================= */
+
+typedef uint16_t gpr_mask_t;
+
+static inline int gpr_index(enum reg_enum reg)
+{
+    switch (get_64bit_parent(reg)) {
+        case R_RAX: return 0;
+        case R_RCX: return 1;
+        case R_RDX: return 2;
+        case R_RBX: return 3;
+        case R_RSP: return 4;
+        case R_RBP: return 5;
+        case R_RSI: return 6;
+        case R_RDI: return 7;
+        case R_R8:  return 8;
+        case R_R9:  return 9;
+        case R_R10: return 10;
+        case R_R11: return 11;
+        case R_R12: return 12;
+        case R_R13: return 13;
+        case R_R14: return 14;
+        case R_R15: return 15;
+        default:    return -1;
+    }
+}
+
+static inline gpr_mask_t gpr_mask(enum reg_enum reg)
+{
+    int idx = gpr_index(reg);
+    return (idx >= 0) ? (1U << idx) : 0;
+}
+
+#define LFI_STATIC_EXCLUDED_GPRS \
+    (gpr_mask(R_RSP) | gpr_mask(R_RBP) | gpr_mask(R_R11) | gpr_mask(R_R14) | gpr_mask(R_R15) | \
+     gpr_mask(R_RAX) | gpr_mask(R_RCX) | gpr_mask(R_RDX) | gpr_mask(R_RSI) | gpr_mask(R_RDI))
+
+static const enum reg_enum lfi_gpr_candidate_order[6] = {
+    R_R13, R_R12, R_R10, R_R9, R_R8, R_RBX
+};
+
+typedef enum {
+    LFI_REALLOC_NONE = 0,
+    LFI_REALLOC_UNUSED_PROXY,     /* Phase 1: Syntactically unused GPR with entry/exit spills */
+    LFI_REALLOC_DEAD_SUBRANGE     /* Phase 2: Locally dead GPR with zero entry/exit spills */
+} lfi_realloc_method_t;
+
+struct lfi_bb_entry {
+    gpr_mask_t used_gprs;        /* Bitmask of all GPRs referenced in BB */
+    int ref_count_r11;           /* Frequency count of Virtual R11 references */
+    int ref_count_r14;           /* Frequency count of Virtual R14 references */
+    int ref_count_r15;           /* Frequency count of Virtual R15 references */
+    
+    enum reg_enum proxy_r11;     /* Assigned physical proxy GPR for R11 (or R_none) */
+    enum reg_enum proxy_r14;     /* Assigned physical proxy GPR for R14 (or R_none) */
+    enum reg_enum proxy_r15;     /* Assigned physical proxy GPR for R15 (or R_none) */
+
+    enum lfi_pseudo_reg spill_r11; /* Context Scratch Spill Slot for R11 */
+    enum lfi_pseudo_reg spill_r14; /* Context Scratch Spill Slot for R14 */
+    enum lfi_pseudo_reg spill_r15; /* Context Scratch Spill Slot for R15 */
+
+    lfi_realloc_method_t method; /* Reallocation strategy for this block */
+    char *entry_label;           /* Entry label name if any (for verbose logging) */
+};
+
+struct lfi_bb_table {
+    struct lfi_bb_entry *entries;
+    size_t capacity;
+    size_t count;
+};
+
+static struct lfi_bb_table lfi_bb_tab = { NULL, 0, 0 };
+static size_t lfi_curr_bb_id = 0;
+
+static int lfi_get_unused_spill_offset(void)
+{
+    if (!lfi_realloc_enabled || lfi_curr_bb_id >= lfi_bb_tab.count) {
+        return 24; // Default to Slot 1 (offset 24)
+    }
+
+    const struct lfi_bb_entry *entry = &lfi_bb_tab.entries[lfi_curr_bb_id];
+    bool slot1_used = false;
+    bool slot2_used = false;
+
+    if (entry->proxy_r11 != R_none && entry->spill_r11 != 0) {
+        if (entry->spill_r11 == R_LFI_SPILL_SLOT_1) slot1_used = true;
+        if (entry->spill_r11 == R_LFI_SPILL_SLOT_2) slot2_used = true;
+    }
+    if (entry->proxy_r14 != R_none && entry->spill_r14 != 0) {
+        if (entry->spill_r14 == R_LFI_SPILL_SLOT_1) slot1_used = true;
+        if (entry->spill_r14 == R_LFI_SPILL_SLOT_2) slot2_used = true;
+    }
+    if (entry->proxy_r15 != R_none && entry->spill_r15 != 0) {
+        if (entry->spill_r15 == R_LFI_SPILL_SLOT_1) slot1_used = true;
+        if (entry->spill_r15 == R_LFI_SPILL_SLOT_2) slot2_used = true;
+    }
+
+    if (!slot1_used) return 24;
+    if (!slot2_used) return 32;
+    return 0; // Use Slot 3 (offset 0)
+}
+static bool lfi_bb_ended_with_cf = false;
+static bool lfi_bb_ended_with_cf_pass0 = false;
+
+static void lfi_process_insn_pass1(insn *ins);
+
+static void init_bb_entry(struct lfi_bb_entry *entry)
+{
+    memset(entry, 0, sizeof(*entry));
+    entry->proxy_r11 = R_none;
+    entry->proxy_r14 = R_none;
+    entry->proxy_r15 = R_none;
+    entry->spill_r11 = (enum lfi_pseudo_reg)0;
+    entry->spill_r14 = (enum lfi_pseudo_reg)0;
+    entry->spill_r15 = (enum lfi_pseudo_reg)0;
+    entry->method = LFI_REALLOC_NONE;
+}
+
+static void lfi_ensure_bb_table_capacity(size_t needed)
+{
+    if (needed > lfi_bb_tab.capacity) {
+        size_t old_cap = lfi_bb_tab.capacity;
+        size_t new_cap = old_cap ? old_cap * 2 : 64;
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+        lfi_bb_tab.entries = nasm_realloc(lfi_bb_tab.entries, new_cap * sizeof(struct lfi_bb_entry));
+        for (size_t i = old_cap; i < new_cap; i++) {
+            init_bb_entry(&lfi_bb_tab.entries[i]);
+        }
+        lfi_bb_tab.capacity = new_cap;
+    }
+}
+
+static void lfi_reset_bb_table(void)
+{
+    if (lfi_bb_tab.entries) {
+        for (size_t i = 0; i < lfi_bb_tab.capacity; i++) {
+            if (lfi_bb_tab.entries[i].entry_label) {
+                nasm_free(lfi_bb_tab.entries[i].entry_label);
+            }
+        }
+        nasm_free(lfi_bb_tab.entries);
+        lfi_bb_tab.entries = NULL;
+    }
+    lfi_bb_tab.capacity = 0;
+    lfi_bb_tab.count = 0;
+}
+
+#define LFI_REALLOC_MIN_REFS 4
+
+static void lfi_bb_select_strategy_phase1(struct lfi_bb_entry *entry)
+{
+    gpr_mask_t allocated_proxies_mask = 0;
+    int active_swaps = 0;
+
+    entry->proxy_r11 = R_none;
+    entry->proxy_r14 = R_none;
+    entry->proxy_r15 = R_none;
+    entry->spill_r11 = (enum lfi_pseudo_reg)0;
+    entry->spill_r14 = (enum lfi_pseudo_reg)0;
+    entry->spill_r15 = (enum lfi_pseudo_reg)0;
+    entry->method = LFI_REALLOC_NONE;
+
+    struct realloc_target {
+        enum reg_enum v_target;
+        int count;
+        enum reg_enum *proxy_out;
+        enum lfi_pseudo_reg *spill_out;
+    } targets[3] = {
+        { R_R11, entry->ref_count_r11, &entry->proxy_r11, &entry->spill_r11 },
+        { R_R14, entry->ref_count_r14, &entry->proxy_r14, &entry->spill_r14 },
+        { R_R15, entry->ref_count_r15, &entry->proxy_r15, &entry->spill_r15 }
+    };
+
+    for (int i = 0; i < 2; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (targets[j].count > targets[i].count) {
+                struct realloc_target tmp = targets[i];
+                targets[i] = targets[j];
+                targets[j] = tmp;
+            }
+        }
+    }
+
+    int max_targets = lfi_realloc_max_targets;
+    if (max_targets > 3) max_targets = 3;
+    if (max_targets < 0) max_targets = 0;
+
+    enum lfi_pseudo_reg spill_slots[3] = { R_LFI_SPILL_SLOT_1, R_LFI_SPILL_SLOT_2, R_LFI_SPILL_SLOT_3 };
+
+    for (int t = 0; t < 3; t++) {
+        if (targets[t].count >= LFI_REALLOC_MIN_REFS && active_swaps < max_targets) {
+            gpr_mask_t candidate_unused =
+                (~(entry->used_gprs | LFI_STATIC_EXCLUDED_GPRS | allocated_proxies_mask)) & 0xFFFF;
+
+            for (int c = 0; c < 6; c++) {
+                enum reg_enum gpr = lfi_gpr_candidate_order[c];
+                if (candidate_unused & gpr_mask(gpr)) {
+                    *(targets[t].proxy_out) = gpr;
+                    *(targets[t].spill_out) = spill_slots[active_swaps];
+                    entry->method = LFI_REALLOC_UNUSED_PROXY;
+                    allocated_proxies_mask |= gpr_mask(gpr);
+                    active_swaps++;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (lfi_verbose_realloc && pass_first()) {
+        const char *label_name = entry->entry_label ? entry->entry_label : "<unnamed>";
+        if (entry->proxy_r11 != R_none || entry->proxy_r14 != R_none || entry->proxy_r15 != R_none) {
+            printf("info: [LFI-Realloc] Basic Block '%s':\n", label_name);
+            printf("      Virtual Target Usage: %%r11 (%d refs), %%r14 (%d refs), %%r15 (%d refs).\n",
+                   entry->ref_count_r11, entry->ref_count_r14, entry->ref_count_r15);
+            if (entry->proxy_r11 != R_none)
+                printf("      Action Applied     : %%r11 -> %s (Method 1, Spill Slot %s).\n",
+                       regName(entry->proxy_r11), entry->spill_r11 == R_LFI_SPILL_SLOT_1 ? "24" : "32");
+            if (entry->proxy_r14 != R_none)
+                printf("      Action Applied     : %%r14 -> %s (Method 1, Spill Slot %s).\n",
+                       regName(entry->proxy_r14), entry->spill_r14 == R_LFI_SPILL_SLOT_1 ? "24" : "32");
+            if (entry->proxy_r15 != R_none)
+                printf("      Action Applied     : %%r15 -> %s (Method 1, Spill Slot %s).\n",
+                       regName(entry->proxy_r15), entry->spill_r15 == R_LFI_SPILL_SLOT_1 ? "24" : "32");
+        } else if (entry->ref_count_r11 > 0 || entry->ref_count_r14 > 0 || entry->ref_count_r15 > 0) {
+            if (entry->ref_count_r11 < LFI_REALLOC_MIN_REFS &&
+                entry->ref_count_r14 < LFI_REALLOC_MIN_REFS &&
+                entry->ref_count_r15 < LFI_REALLOC_MIN_REFS) {
+                printf("info: [LFI-Realloc] Basic Block '%s':\n", label_name);
+                printf("      Action Taken        : Reallocation bypassed (ref count < threshold %d; flat setup cost exceeds baseline).\n",
+                       LFI_REALLOC_MIN_REFS);
+            } else {
+                printf("warning: [LFI-Realloc] Basic Block '%s':\n", label_name);
+                printf("         Action Taken        : Reallocation bypassed (register pressure exhaustion; retaining baseline LFI virtualization).\n");
+            }
+        }
+    }
+}
+
+static void lfi_update_operand_reg(operand *op, enum reg_enum new_reg)
+{
+    op->basereg = new_reg;
+    op->type &= ~(REG_EA | REG64 | REG32 | REG16 | REG8 | REGMEM | REG_CLASS_MASK);
+    op->type |= nasm_reg_flags[new_reg];
+}
+
+static void lfi_mutate_op_reg(operand *op, enum reg_enum old_reg_parent, enum reg_enum proxy_gpr)
+{
+    if (is_op_type(*op, REGISTER)) {
+        if (get_64bit_parent(op->basereg) == old_reg_parent) {
+            enum reg_enum sized_proxy = get_sized_reg(proxy_gpr, op->basereg);
+            lfi_update_operand_reg(op, sized_proxy);
+        }
+    } else if (is_op_type(*op, MEMORY)) {
+        bool changed = false;
+        if (op->basereg != R_none && get_64bit_parent(op->basereg) == old_reg_parent) {
+            enum reg_enum sized_proxy = get_sized_reg(proxy_gpr, op->basereg);
+            op->basereg = sized_proxy;
+            changed = true;
+        }
+        if (op->indexreg != R_none && get_64bit_parent(op->indexreg) == old_reg_parent) {
+            enum reg_enum sized_proxy = get_sized_reg(proxy_gpr, op->indexreg);
+            op->indexreg = sized_proxy;
+            changed = true;
+        }
+        if (changed) {
+            update_mem_operand_subclass_flags(op);
+        }
+    }
+}
+
+static bool lfi_lower_pseudo_reg_operand(operand *op)
+{
+    int offset = 0;
+    if (op->basereg == (enum reg_enum)R_LFI_SPILL_SLOT_1) {
+        offset = 24;
+    } else if (op->basereg == (enum reg_enum)R_LFI_SPILL_SLOT_2) {
+        offset = 32;
+    } else if (op->basereg == (enum reg_enum)R_LFI_SPILL_SLOT_3) {
+        offset = 0;
+    } else if (op->basereg == (enum reg_enum)R_LFI_VIRT_R11) {
+        offset = 40;
+    } else if (op->basereg == (enum reg_enum)R_LFI_VIRT_R14) {
+        offset = 48;
+    } else if (op->basereg == (enum reg_enum)R_LFI_VIRT_R15) {
+        offset = 56;
+    } else {
+        return false;
+    }
+
+    op->type = MEMORY | BITS64;
+    op->basereg = LFI_CTXREG;
+    op->indexreg = R_none;
+    op->scale = 1;
+    op->offset = offset;
+    op->segment = NO_SEG;
+    op->eaflags = 0;
+    update_mem_operand_subclass_flags(op);
+    return true;
+}
+
+static bool lfi_is_control_flow(const insn *ins)
+{
+    if (ins->opcode < 0) return false;
+    const char *name = nasm_insn_names[ins->opcode];
+    if (!name) return false;
+    if (name[0] == 'j' || strcmp(name, "call") == 0 || strncmp(name, "loop", 4) == 0 ||
+        strncmp(name, "ret", 3) == 0 || ins->opcode == I_SYSCALL) {
+        return true;
+    }
+    return false;
+}
+
+
+static void build_pseudo_mov(insn *ins, int bits, enum reg_enum op0_reg, enum reg_enum op1_reg)
+{
+    init_insn(ins);
+    ins->opcode = I_MOV;
+    ins->operands = 2;
+    ins->bits = bits;
+
+    if (op0_reg < (enum reg_enum)(EXPR_REG_START + 500)) {
+        ins->oprs[0].type = nasm_reg_flags[op0_reg];
+    } else {
+        ins->oprs[0].type = REGISTER;
+    }
+    ins->oprs[0].basereg = op0_reg;
+
+    if (op1_reg < (enum reg_enum)(EXPR_REG_START + 500)) {
+        ins->oprs[1].type = nasm_reg_flags[op1_reg];
+    } else {
+        ins->oprs[1].type = REGISTER;
+    }
+    ins->oprs[1].basereg = op1_reg;
+}
+
+static bool lfi_bb_entry_setup_emitted = false;
+static bool lfi_user_insn_emitted_in_bb = false;
+
+static void lfi_emit_entry_setup(const struct lfi_bb_entry *entry, int bits)
+{
+    if (lfi_bb_entry_setup_emitted)
+        return;
+
+    insn tmp;
+    if (entry->proxy_r11 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)entry->spill_r11, entry->proxy_r11);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r11, (enum reg_enum)R_LFI_VIRT_R11);
+        lfi_process_insn_pass1(&tmp);
+    }
+    if (entry->proxy_r14 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)entry->spill_r14, entry->proxy_r14);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r14, (enum reg_enum)R_LFI_VIRT_R14);
+        lfi_process_insn_pass1(&tmp);
+    }
+    if (entry->proxy_r15 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)entry->spill_r15, entry->proxy_r15);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r15, (enum reg_enum)R_LFI_VIRT_R15);
+        lfi_process_insn_pass1(&tmp);
+    }
+    lfi_bb_entry_setup_emitted = true;
+}
+
+static void lfi_emit_exit_teardown(const struct lfi_bb_entry *entry, int bits)
+{
+    insn tmp;
+    if (entry->proxy_r11 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)R_LFI_VIRT_R11, entry->proxy_r11);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r11, (enum reg_enum)entry->spill_r11);
+        lfi_process_insn_pass1(&tmp);
+    }
+    if (entry->proxy_r14 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)R_LFI_VIRT_R14, entry->proxy_r14);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r14, (enum reg_enum)entry->spill_r14);
+        lfi_process_insn_pass1(&tmp);
+    }
+    if (entry->proxy_r15 != R_none) {
+        build_pseudo_mov(&tmp, bits, (enum reg_enum)R_LFI_VIRT_R15, entry->proxy_r15);
+        lfi_process_insn_pass1(&tmp);
+        build_pseudo_mov(&tmp, bits, entry->proxy_r15, (enum reg_enum)entry->spill_r15);
+        lfi_process_insn_pass1(&tmp);
+    }
+}
+
 /*
  * High-level driver to replace instructions with LFI sandboxed sequences.
  * Dispatches to specialized expand modules matching the LLVM rewriter's structure.
@@ -1483,6 +1879,21 @@ static void rewrite_insn(insn *ins, int *count, insn *ret, bundle_lock_mask_t *b
 {
     if (ofmt != &of_elf64) {
         nasm_fatal("LFI: LFI mode is only supported for the elf64 output format");
+    }
+
+    /* Lower synthetic LFI pseudo-registers directly to context memory operands */
+    bool contains_pseudo = false;
+    for (int i = 0; i < ins->operands; i++) {
+        if (lfi_lower_pseudo_reg_operand(&ins->oprs[i])) {
+            contains_pseudo = true;
+        }
+    }
+    if (contains_pseudo) {
+        *count = 1;
+        *bundle_lock_mask = 0b0000;
+        ret[0] = *ins;
+        ret[0].times = 1;
+        return;
     }
 
     /* Bypass data directives (db, dw, dd, dq, resb, resw, incbin, etc.)
@@ -1617,23 +2028,14 @@ static int get_bundle_padsize(int64_t offset, int minSpaceInCurrBlock, int64_t r
     return 0; /* Satisfy compiler */
 }
 
-void lfi_process_insn(insn *ins)
+static void lfi_process_insn_pass1(insn *ins)
 {
     int rewriteCount = 0;
     insn rewrittenInsns[16];
     memset(rewrittenInsns, 0, sizeof(rewrittenInsns));
     bundle_lock_mask_t bundle_lock_mask = 0;
 
-    if (ins->opcode == I_none) {
-        /* Only a label, it is aligned in lfi_align_label_if_needed */
-        process_one_insn(ins);
-        return;
-    }
-
-    int32_t times = ins->times;
-    if (times <= 0) {
-        return;
-    }
+    int32_t times = ins->times ? ins->times : 1;
 
     rewrite_insn(ins, &rewriteCount, rewrittenInsns, &bundle_lock_mask);
 
@@ -1701,6 +2103,221 @@ void lfi_process_insn(insn *ins)
         }
     }
 }
+
+int64_t lfi_handle_label_teardown(const char *label, int32_t segment, int64_t offset)
+{
+    (void)segment;
+    if (!lfi_realloc_enabled)
+        return offset;
+
+    int bits = 64;
+
+    if (pass_first()) {
+        struct lfi_bb_entry *entry = &lfi_bb_tab.entries[lfi_curr_bb_id];
+        if (!lfi_bb_ended_with_cf_pass0) {
+            lfi_bb_select_strategy_phase1(entry);
+            lfi_curr_bb_id++;
+            lfi_ensure_bb_table_capacity(lfi_curr_bb_id + 1);
+            if (lfi_curr_bb_id + 1 > lfi_bb_tab.count) lfi_bb_tab.count = lfi_curr_bb_id + 1;
+            init_bb_entry(&lfi_bb_tab.entries[lfi_curr_bb_id]);
+            entry = &lfi_bb_tab.entries[lfi_curr_bb_id];
+        }
+        if (!entry->entry_label) {
+            entry->entry_label = nasm_strdup(label);
+        }
+        lfi_bb_ended_with_cf_pass0 = false;
+    } else {
+        if (lfi_bb_entry_setup_emitted && !lfi_user_insn_emitted_in_bb) {
+            /* Alias label defined before any body instructions in the block */
+            return offset;
+        }
+
+        if (lfi_curr_bb_id < lfi_bb_tab.count &&
+            lfi_bb_tab.entries[lfi_curr_bb_id].entry_label &&
+            strcmp(lfi_bb_tab.entries[lfi_curr_bb_id].entry_label, label) == 0) {
+            /* Already at the correct block (e.g. after CF jump) */
+        } else {
+            bool is_next_block_entry = false;
+            if (lfi_curr_bb_id + 1 < lfi_bb_tab.count &&
+                lfi_bb_tab.entries[lfi_curr_bb_id + 1].entry_label &&
+                strcmp(lfi_bb_tab.entries[lfi_curr_bb_id + 1].entry_label, label) == 0) {
+                is_next_block_entry = true;
+            }
+
+            if (is_next_block_entry) {
+                if (!lfi_bb_ended_with_cf) {
+                    lfi_emit_exit_teardown(&lfi_bb_tab.entries[lfi_curr_bb_id], bits);
+                }
+                lfi_curr_bb_id++;
+                lfi_bb_entry_setup_emitted = false;
+                lfi_user_insn_emitted_in_bb = false;
+                lfi_bb_ended_with_cf = false;
+            }
+        }
+    }
+    return location.offset;
+}
+
+void lfi_handle_label_setup(const char *label, int32_t segment)
+{
+    (void)segment;
+    if (!lfi_realloc_enabled)
+        return;
+
+    if (!pass_first()) {
+        if (lfi_bb_entry_setup_emitted && !lfi_user_insn_emitted_in_bb) {
+            return;
+        }
+
+        lfi_bb_ended_with_cf = false;
+    }
+}
+
+static void lfi_scan_insn_pass0(insn *ins)
+{
+    struct lfi_bb_entry *entry = &lfi_bb_tab.entries[lfi_curr_bb_id];
+
+    for (int i = 0; i < ins->operands; i++) {
+        operand *op = &ins->oprs[i];
+        if (is_op_type(*op, REGISTER)) {
+            if (op->basereg != R_none) {
+                entry->used_gprs |= gpr_mask(op->basereg);
+                if (get_64bit_parent(op->basereg) == R_R11) entry->ref_count_r11++;
+                if (get_64bit_parent(op->basereg) == R_R14) entry->ref_count_r14++;
+                if (get_64bit_parent(op->basereg) == R_R15) entry->ref_count_r15++;
+            }
+        } else if (is_op_type(*op, MEMORY)) {
+            if (op->basereg != R_none) {
+                entry->used_gprs |= gpr_mask(op->basereg);
+                if (get_64bit_parent(op->basereg) == R_R11) entry->ref_count_r11++;
+                if (get_64bit_parent(op->basereg) == R_R14) entry->ref_count_r14++;
+                if (get_64bit_parent(op->basereg) == R_R15) entry->ref_count_r15++;
+            }
+            if (op->indexreg != R_none) {
+                entry->used_gprs |= gpr_mask(op->indexreg);
+                if (get_64bit_parent(op->indexreg) == R_R11) entry->ref_count_r11++;
+                if (get_64bit_parent(op->indexreg) == R_R14) entry->ref_count_r14++;
+                if (get_64bit_parent(op->indexreg) == R_R15) entry->ref_count_r15++;
+            }
+        }
+    }
+
+    if (lfi_is_control_flow(ins)) {
+        lfi_bb_select_strategy_phase1(entry);
+        lfi_curr_bb_id++;
+        lfi_ensure_bb_table_capacity(lfi_curr_bb_id + 1);
+        if (lfi_curr_bb_id + 1 > lfi_bb_tab.count) lfi_bb_tab.count = lfi_curr_bb_id + 1;
+        init_bb_entry(&lfi_bb_tab.entries[lfi_curr_bb_id]);
+        lfi_bb_ended_with_cf_pass0 = true;
+    } else {
+        lfi_bb_ended_with_cf_pass0 = false;
+    }
+}
+
+static void lfi_transform_and_process_pass1(insn *ins)
+{
+    if (lfi_curr_bb_id >= lfi_bb_tab.count) {
+        lfi_process_insn_pass1(ins);
+        return;
+    }
+
+    struct lfi_bb_entry *entry = &lfi_bb_tab.entries[lfi_curr_bb_id];
+
+    if (!lfi_bb_entry_setup_emitted) {
+        lfi_emit_entry_setup(entry, ins->bits);
+    }
+
+    insn working_ins = *ins;
+
+
+    if (entry->proxy_r11 != R_none) {
+        for (int i = 0; i < working_ins.operands; i++) {
+            lfi_mutate_op_reg(&working_ins.oprs[i], R_R11, entry->proxy_r11);
+        }
+    }
+    if (entry->proxy_r14 != R_none) {
+        for (int i = 0; i < working_ins.operands; i++) {
+            lfi_mutate_op_reg(&working_ins.oprs[i], R_R14, entry->proxy_r14);
+        }
+    }
+    if (entry->proxy_r15 != R_none) {
+        for (int i = 0; i < working_ins.operands; i++) {
+            lfi_mutate_op_reg(&working_ins.oprs[i], R_R15, entry->proxy_r15);
+        }
+    }
+
+    bool is_cf = lfi_is_control_flow(&working_ins);
+
+    if (is_cf) {
+        lfi_emit_exit_teardown(entry, working_ins.bits);
+        lfi_process_insn_pass1(&working_ins);
+        lfi_curr_bb_id++;
+        lfi_bb_entry_setup_emitted = false;
+        lfi_user_insn_emitted_in_bb = false;
+        lfi_bb_ended_with_cf = true;
+    } else {
+        lfi_process_insn_pass1(&working_ins);
+        lfi_user_insn_emitted_in_bb = true;
+        lfi_bb_ended_with_cf = false;
+    }
+}
+
+void lfi_process_insn(insn *ins)
+{
+    static int64_t last_pass = -1;
+    if (pass_count() != last_pass) {
+        last_pass = pass_count();
+        lfi_curr_bb_id = 0;
+        lfi_bb_ended_with_cf = false;
+        lfi_bb_ended_with_cf_pass0 = false;
+        lfi_bb_entry_setup_emitted = false;
+        lfi_user_insn_emitted_in_bb = false;
+        if (pass_first()) {
+            lfi_reset_bb_table();
+            lfi_ensure_bb_table_capacity(1);
+            lfi_bb_tab.count = 1;
+            memset(&lfi_bb_tab.entries[0], 0, sizeof(struct lfi_bb_entry));
+        }
+    }
+
+    /* 1. Handle Data Directives in Executable Code Sections */
+    if (opcode_is_db(ins->opcode) || opcode_is_resb(ins->opcode) || ins->opcode == I_INCBIN) {
+        if (lfi_is_code_segment(location.segment) && pass_first()) {
+            nasm_warn(WARN_OTHER,
+                      "[LFI-DataInText] Data directive placed inside executable code section. "
+                      "Data will be emitted un-sandboxed into executable memory and skipped by LFI reallocator.");
+        }
+        lfi_bb_ended_with_cf = false;
+        lfi_bb_ended_with_cf_pass0 = false;
+        process_one_insn(ins);
+        return;
+    }
+
+    /* 2. Standalone Label / Empty instruction */
+    if (ins->opcode == I_none) {
+        process_one_insn(ins);
+        return;
+    }
+
+    int32_t times = ins->times;
+    if (times <= 0)
+        return;
+
+    /* 3. Pass 0 Scanning vs Pass 1+ Transformation */
+    if (pass_first()) {
+        if (lfi_realloc_enabled) {
+            lfi_scan_insn_pass0(ins);
+        }
+        lfi_process_insn_pass1(ins);
+    } else {
+        if (lfi_realloc_enabled) {
+            lfi_transform_and_process_pass1(ins);
+        } else {
+            lfi_process_insn_pass1(ins);
+        }
+    }
+}
+
 
 /* Low-level NOP emitter for LFI label alignment */
 void lfi_emit_nops(int32_t segment, int count)

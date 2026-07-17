@@ -66,6 +66,9 @@ bool lfi_no_segue = false;
 bool lfi_no_loads = false;
 bool lfi_no_stores = false;
 bool lfi_warn_only = false;
+bool lfi_realloc_enabled = true;
+bool lfi_verbose_realloc = false;
+int lfi_realloc_max_targets = 2;
 enum pass_type _pass_type;
 const char * const _pass_types[] =
 {
@@ -1191,6 +1194,21 @@ static bool process_arg(char *p, char *q, int pass)
                     lfi_mode = true;
                     lfi_warn_only = true;
                 }
+            } else if (strcmp(p, "-lfi-no-realloc") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_realloc_enabled = false;
+                }
+            } else if (strcmp(p, "-lfi-verbose-realloc") == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_verbose_realloc = true;
+                }
+            } else if (strncmp(p, "-lfi-max-targets=", 17) == 0) {
+                if (pass == 1) {
+                    lfi_mode = true;
+                    lfi_realloc_max_targets = atoi(p + 17);
+                }
             } else {
                 if (pass == 2)
                     copy_filename(&listname, param, "listing");
@@ -2121,6 +2139,8 @@ static void help(FILE *out, const char *what)
         fputs(
             "    -t             assemble in limited SciTech TASM compatible mode\n"
             "    -lfi           assemble in LFI sandboxed mode\n"
+            "    -lfi-no-realloc disable basic-block register reallocation\n"
+            "    -lfi-verbose-realloc enable verbose logging for register reallocation\n"
             "    -E (or -e)     preprocess only (writes output to stdout by default)\n"
             "    -a             don't preprocess (assemble only)\n"
             "    -Ipath         add a pathname to the include file path\n"
